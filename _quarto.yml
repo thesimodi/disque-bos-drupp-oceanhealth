@@ -1,0 +1,18 @@
+project:
+  type: book
+
+book:
+  title: "Replication Code for Disque et al. (2025)"
+  author: ""
+  date: today
+  chapters:
+    - index.qmd
+    - 4_Code/01_Prep_Decision_Data.qmd
+    - 4_Code/02_Prep_Quality_Controls.qmd
+    - 4_Code/03_Prep_Survey_Data.qmd
+    - 4_Code/04_GARP_Test.qmd
+    - 4_Code/05_Sample_Selection.qmd
+    - 4_Code/06_Figures.qmd
+
+format:
+  html

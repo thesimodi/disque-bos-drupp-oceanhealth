@@ -1,0 +1,131 @@
+---
+title: "Preperation of Quality Controls"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(vroom)
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(here)
+library(janitor)
+library(kableExtra)
+```
+
+```{r message=FALSE}
+# Import the data from the online data collections (sl = soft-launch 1 + 2, fl = full-launch, fl2 = full-launch Dynata)
+online_page_times_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "PageTimes_sl12.csv"))
+online_intro_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_intro_sl12.csv"),
+                            col_types = list(participant_label = col_character()))
+online_training_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_training_sl12.csv"),
+                               col_types = list(participant_label = col_character()))
+online_survey_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_survey_sl12.csv"),
+                             col_types = list(participant_label = col_character()))
+
+online_page_times_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "PageTimes_fl.csv"))
+online_intro_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_intro_fl.csv"),
+                            col_types = list(participant_label = col_character()))
+online_training_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_training_fl.csv"),
+                               col_types = list(participant_label = col_character()))
+online_survey_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_survey_fl.csv"),
+                             col_types = list(participant_label = col_character()))
+
+online_page_times_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "PageTimes_fl2.csv"))
+online_intro_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Data_intro_fl2.csv"),
+                            col_types = list(participant_label = col_character()))
+online_training_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Data_training_fl2.csv"),
+                               col_types = list(participant_label = col_character()))
+online_survey_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Data_survey_fl2.csv"),
+                             col_types = list(participant_label = col_character()))
+
+# Combine data from the soft-launches and full-launch
+online_page_times <- rbind(online_page_times_sl, online_page_times_fl, online_page_times_fl2)
+online_intro <- rbind(online_intro_sl, online_intro_fl, online_intro_fl2)
+online_training <- rbind(online_training_sl, online_training_fl, online_training_fl2)
+online_survey <- rbind(online_survey_sl, online_survey_fl, online_survey_fl2)
+
+# Add participant codes to page times
+online_page_times %<>%
+  left_join(x = online_page_times,
+            y = select(online_intro, "participant_code", "participant_label"),
+            by = "participant_code")
+```
+
+## Page when participants ended {.hidden .unnumbered .unlisted}
+```{r, rows.print=20}
+# Manually merge the two attention check pages
+online_intro$`_current_page_name`[online_intro$`_current_page_name` == "P1_Fail_Intro"] <- "Failed_Attention_Check"
+online_intro$`_current_page_name`[online_intro$`_current_page_name` == "P2_Fail_Attention_Check"] <- "Failed_Attention_Check"
+```
+
+```{r}
+complete_ids <- online_intro %>%
+  filter(`_current_page_name` == "P03_Thank_You") %>% 
+  select(participant_code)
+
+# Filter the relevant datasets
+online_intro %<>% inner_join(y = complete_ids, by = "participant_code")
+online_training %<>% inner_join(y = complete_ids, by = "participant_code")
+online_survey %<>% inner_join(y = complete_ids, by = "participant_code")
+online_page_times %<>% inner_join(y = complete_ids, by = "participant_code")
+```
+
+# Time used {.hidden .unnumbered .unlisted}
+```{r, warning = FALSE, message = FALSE}
+# Calculate the seconds spent on a page
+online_page_times %<>%
+  mutate(start_time = lubridate::as_datetime(epoch_time)) %>%
+  select(-c(participant_id_in_session, epoch_time, timeout_happened, is_wait_page))
+
+# Sort the table with data.table
+online_page_times <- as.data.table(online_page_times)[order(participant_code, start_time)] %>% as.data.frame()
+
+online_page_times %<>%
+  group_by(participant_code, session_code) %>%
+  mutate(time_on_page = lead(start_time) - start_time)
+
+# Define the app order
+app_order <- tibble(
+  app_number = 1:8,
+  app_name = c("intro",
+               "training_task",
+               "decision_block_1",
+               "decision_block_2",
+               "decision_block_3",
+               "decision_block_4",
+               "decision_block_5",
+               "survey")
+)
+
+# Add it to the page times
+online_page_times %<>% left_join(app_order)
+online_page_times %<>% relocate(app_number, .before = app_name)
+
+# Calculate the overall time spent on the experiment for each subject
+online_time_per_subject <- online_page_times %>%
+  group_by(participant_code, session_code) %>%
+  filter(!is.na(app_number)) %>%
+  # First sum up the time for each participant
+  summarize(seconds_on_experiment = sum(time_on_page, na.rm = TRUE),
+            minutes_on_experiment = seconds_on_experiment / 60,
+            pages_seen = n()) %>% 
+  ungroup()
+```
+
+```{r}
+comp_checks_online <- online_training %>%
+  select(participant_code,
+         total_number_errors_hidden,
+         comprehension_errors_hidden)
+
+quality_controls <- online_time_per_subject %>%
+  inner_join(y = comp_checks_online, by = "participant_code")
+
+write_csv(quality_controls, here::here("1_Data", "2_processed", "Quality_Controls.csv"))
+```

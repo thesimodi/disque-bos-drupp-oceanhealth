@@ -1,0 +1,92 @@
+---
+title: "GARP Test"
+format:
+  html:
+    include: false
+    self-contained: true
+execute:
+  freeze: auto
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(readr)
+library(magrittr)
+library(here)
+library(ggplot2)
+library(kableExtra)
+library(parallel)
+library(doParallel)
+library(foreach)
+
+# Warning: This script can take more than 1 hour to run (with parallel processing)
+```
+
+
+```{r}
+# We load the programs from Polisson et al. 2020
+path_to_programs <- here::here("4_Code", "programs_polisson_etal_2020")
+
+source(here::here(path_to_programs, "ccei_garp.R"))
+source(here::here(path_to_programs, "garp.R"))
+source(here::here(path_to_programs, "warshall.R"))
+```
+
+
+```{r message=FALSE, warning=FALSE, include = FALSE}
+# Import data
+online_decision_tasks <- read_csv(here::here("1_Data", "2_processed", "Data_decision_task_online.csv"))
+
+# Select only the relevant columns
+garp_input <- online_decision_tasks %>%
+  select(participant_code, block_number, round, to_goal1, to_goal2, to_goal1_max, to_goal2_max)
+
+# Initiate a results table
+results <- garp_input %>% 
+  group_by(participant_code, block_number) %>% 
+  tally() %>%
+  mutate(ccei = NA) %>% 
+  select(-n) %>% 
+  rename(task_number = block_number)
+
+# Setup function to loop through all rows in subjects (i.e., over all subjects and task_numbers)
+# Run the program from Polisson et al. 2020
+
+run_garp <- function(subject_task) {
+  participant_code = results[[subject_task, 1]]
+  task_number = results[[subject_task, 2]]
+
+  # To suppress progress, comment out the next line
+  # print(paste("Subject", participant_code, "--", task_number))
+
+  data = as.matrix(garp_input[garp_input[, 1] == participant_code & garp_input[, 2] == as.character(task_number), 4:7])
+  p = rbind(1 / data[, 4], 1 / data[, 3])
+  x = rbind(data[, 2], data[, 1])
+
+  ccei_value = ccei_garp(p, x)
+  return(c(participant_code, as.numeric(task_number), as.numeric(ccei_value)))
+}
+
+# Use parallel processing to speed up the computation
+# Initialize and register cluster
+numCores <- parallel::detectCores()
+cl <- parallel::makeCluster(numCores)
+registerDoParallel(cl)
+
+# Run the tasks in parallel and collect results
+results_list <- foreach(i = seq_len(nrow(results)), .combine = rbind) %dopar% {
+  run_garp(i)
+}
+
+stopCluster(cl)
+
+# Update the results dataframe with the collected results
+# First convert results_list to a data frame with correct column types
+results_list <- as.data.frame(results_list, stringsAsFactors = FALSE)
+colnames(results_list) <- c("participant_code", "task_number", "ccei")
+results_list[, 2:3] <- lapply(results_list[, 2:3], as.numeric)
+results <- as.data.frame(results_list)
+
+# Export GARP results
+write_csv(results, here::here("1_Data", "2_processed", "GARP_results_online_sample.csv"))
+```

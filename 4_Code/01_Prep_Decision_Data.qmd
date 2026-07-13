@@ -1,0 +1,133 @@
+---
+title: "Preperation of Decision Data"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(data.table)
+library(vroom)
+library(magrittr)
+library(here)
+library(ggplot2)
+library(haven)
+```
+
+# Import data {.hidden .unnumbered .unlisted}
+First, we obtain a list of files that we will import.
+```{r}
+# List files from Bilendi
+bilendi_files <- list.files(path = here::here("1_Data", "1_raw", "2023_11_Bilendi"),
+          pattern = "decision_block_",
+          recursive = TRUE,
+          full.names = TRUE)
+
+# List files from Dynata
+dynata_files <- list.files(path = here::here("1_Data", "1_raw", "2024_12_Dynata"),
+          pattern = "decision_block_",
+          recursive = TRUE,
+          full.names = TRUE)
+
+# Combine both lists into one
+files <- c(bilendi_files, dynata_files)
+
+# List files
+files
+
+# Import and bind all files
+decision_tasks <- vroom::vroom(files, col_types = list(participant_label = col_character()))
+
+# Filter for completes (some subjects in the data have dropped out)
+complete_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_sl12.csv"),
+                        col_types = list(participant_label = col_character()))
+complete_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_fl.csv"),
+                        col_types = list(participant_label = col_character()))
+complete_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Completes_fl2.csv"),
+                        col_types = list(participant_label = col_character()))
+
+# Rename "Indonesia" to "indonesia" in complete_sl, complete_fl, and decision tasks as these cause issues in further, case sensitive analyses
+complete_sl$session_label <- tolower(complete_sl$session_label)
+complete_fl$session_label <- tolower(complete_fl$session_label)
+decision_tasks$session_label <- tolower(decision_tasks$session_label)
+
+write_csv(complete_sl, file = here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_sl12.csv"))
+write_csv(complete_fl, file = here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_fl.csv"))
+
+completes <- rbind(complete_sl, complete_fl, complete_fl2)
+
+decision_tasks %<>% inner_join(y = completes, by = c("participant_label", "session_label"))
+```
+
+
+# Data prep {.hidden .unnumbered .unlisted}
+```{r}
+# We add the variable "price of redistribution" to the raw data.
+# We define pog = (to_goal_1_max / to_goal_2_max)
+decision_tasks %<>% 
+  mutate(price_of_redist = to_goal_1_max / to_goal_2_max)
+```
+
+
+Some column filtering and renaming.
+```{r}
+decision_tasks %<>%
+  rename(to_goal1 = to_goal_1,
+         to_goal2 = to_goal_2,
+         to_goal1_max = to_goal_1_max,
+         to_goal2_max = to_goal_2_max)
+
+# The goal codes are only recorded in the first round, so we fill the following rows from the previous one
+decision_tasks %<>%
+  fill(goal1_code, goal2_code,
+       .direction = "down")
+
+# Add a variable for the goal pair
+decision_tasks %<>%
+  mutate(goal_pair = paste0(goal1_code, "-", goal2_code),
+         .after = goal2_code)
+
+# Sort by session name and subject id
+decision_tasks %<>% arrange(session_label, participant_label)
+
+# We introduce a block_number variable that informs about the task block (= number of the goal pair from 1 - 5)
+block_numbers <- decision_tasks %>%
+  group_by(participant_label, goal_pair) %>%
+  tally() %>%
+  mutate(block_number = row_number()) %>% 
+  select(-n)
+
+decision_tasks %<>% left_join(y = block_numbers, by = c("participant_label", "goal_pair"))
+```
+
+
+For the Matlab estimation, we also need the _share_ of budget given to goal 1 [goal 2]. So we will calculate them here.
+```{r}
+decision_tasks %<>%
+  mutate(price_goal1 = 1 / to_goal1_max,
+         price_goal2 = 1 / to_goal2_max,
+         price_ratio = price_goal1 / price_goal2, # This is the inverse of the price of redistribution!
+         to_goal1_p = to_goal1 * price_goal1 / (to_goal1_max * price_goal1), # Divide by the budget
+         to_goal2_p = to_goal2 * price_goal2 / (to_goal2_max * price_goal2))
+```
+
+
+Note, we will introduce a new unique subject id because the current `session_subject_id` is only unique within a session.
+```{r}
+decision_tasks %<>%
+  group_by(participant_label) %>%
+  mutate(id = cur_group_id(), .before = participant_label)
+```
+
+
+# Export {.hidden .unnumbered .unlisted}
+```{r}
+# Save table
+write_csv(decision_tasks,
+          file = here::here("1_Data", "2_processed", "Data_decision_task_online.csv"))
+```
+

@@ -1,0 +1,71 @@
+---
+title: "Preperation of Survey Data"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(readr)
+library(here)
+library(magrittr)
+library(forcats)
+library(vtable)
+```
+
+
+```{r message=FALSE, rows.print=20}
+# Import data
+online_survey_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_survey_sl12.csv"))
+online_survey_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Data_survey_fl.csv"))
+online_survey_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Data_survey_fl2.csv"))
+
+online_survey <- rbind(online_survey_sl, online_survey_fl, online_survey_fl2)
+
+# Rename "Indonesia" to "indonesia" as these cause issues in further, case sensitive analyses
+online_survey$session_label <- tolower(online_survey$session_label)
+
+# Filter for completes
+complete_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_sl12.csv"))
+complete_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_fl.csv"))
+complete_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Completes_fl2.csv"))
+completes <- rbind(complete_sl, complete_fl, complete_fl2)
+
+# FoOQRsEjNNlezhTpJJy4YA** complete but not in survey data
+completes  <- completes %>% filter(!participant_label %in% "FoOQRsEjNNlezhTpJJy4YA**")
+
+online_survey %<>% right_join(y = completes[, "participant_label"], by = "participant_label")
+```
+
+
+```{r message=FALSE, warning=FALSE}
+# Correct some variables from the online sample
+online_survey$siblings[online_survey$siblings == 99] <- 11
+online_survey$number_moves[online_survey$number_moves == 99] <- 11
+online_survey$days_at_sea[online_survey$days_at_sea == 99] <- 11
+
+# Convert variables to factors
+online_survey$gender %<>% as.factor()
+online_survey$gender <- fct_recode(online_survey$gender,
+                                   "male" = "1",
+                                   "female" = "2",
+                                   "non-binary" = "3",
+                                   "n/a" = "4",
+                                   "other" = "5")
+
+online_survey$ocean_health_importance %<>% as.factor()
+online_survey$ocean_health_importance <- fct_recode(online_survey$ocean_health_importance,
+                                                    "not important at all" = "1",
+                                                    "not important" = "2",
+                                                    "rather not important" = "3",
+                                                    "undecided" = "4",
+                                                    "rather important" = "5",
+                                                    "important" = "6",
+                                                    "very important" = "7",
+                                                    "no opinion" = "0")
+
+# Save the data for later use (e.g. figures & tables in the manuscript)
+write_csv(online_survey, here::here("1_Data", "2_processed", "Data_online_survey.csv"))
+```

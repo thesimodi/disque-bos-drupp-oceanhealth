@@ -1,0 +1,12 @@
+---
+title: "Description"
+format:
+  html:
+    toc: true
+    toc_float: true
+    code-fold: true
+    df-print: paged
+    embed-resources: true
+---
+
+Replication Code for Disque et al. (2025)

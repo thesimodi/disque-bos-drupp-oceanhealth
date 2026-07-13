@@ -1,0 +1,243 @@
+---
+title: "Sample Selection"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(here)
+library(readr)
+
+options(knitr.kable.NA = '-')
+```
+
+```{r message=FALSE}
+# Import data
+decision_tasks_raw <- read_csv(here::here("1_Data", "2_processed", "Data_decision_task_online.csv"))
+estimates_raw <- read_csv(here::here("1_Data", "2_processed", "Matlab_Results_OHI_online.csv"))
+estimates_decision_level_raw <- read_csv(here::here("1_Data", "2_processed", "Matlab_Results_OHI_online_decision_level.csv"))
+quality_controls <- read_csv(here::here("1_Data", "2_processed", "Quality_Controls.csv"))
+garp_results <- read_csv(here::here("1_Data", "2_processed", "GARP_results_online_sample.csv"))
+survey_data <- read_csv(here::here("1_Data", "2_processed", "Data_online_survey.csv"))
+
+complete_sl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_sl12.csv"),
+                        col_types = list(participant_label = col_character()))
+complete_fl <- read_csv(here::here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_fl.csv"),
+                        col_types = list(participant_label = col_character()))
+complete_fl2 <- read_csv(here::here("1_Data", "1_raw", "2024_12_Dynata", "Completes_fl2.csv"),
+                        col_types = list(participant_label = col_character()))
+
+completes <- rbind(complete_sl, complete_fl, complete_fl2)
+
+# Add participant code to 'completes'
+completes <- completes %>% left_join(y = survey_data[, c("participant_code", "participant_label")], by = c("participant_label"))
+
+# Define a table with the country abbreviations
+country_abrv <- tribble(
+  ~country_abrv,  ~session_label, ~region_name,
+  "ID", "Indonesia", "Indonesia",
+  "ID", "indonesia", "Indonesia",
+  "CA", "canada-en", "Canada",
+  "CA", "canada-fr", "Canada",
+  "CA", "canada", "Canada",
+  "AU", "australia", "Australia",
+  "CN", "china", "China",
+  "FR", "france", "France",
+  "DE", "germany", "Germany",
+  "IN", "india", "India",
+  "JA", "japan", "Japan",
+  "NI", "nigeria", "Nigeria",
+  "PE", "peru", "Peru",
+  "PH", "philippines", "Philippines",
+  "US", "usa" , "United States",
+)
+
+# List of data names
+data_names <- c("estimates_decision_level_raw",
+                "estimates_raw")
+
+# Apply na.omit to all imported data
+for (name in data_names) {
+  assign(name, na.omit(get(name)))
+}
+
+#### Quality exclusions before commencing with the analysis
+quality_controls <- quality_controls %>%
+  left_join(
+    y = garp_results,
+    by = c("participant_code")) %>%
+  left_join(
+    y = estimates_raw[, c("participant_code", "task_number", "unipref")],
+    by = c("participant_code", "task_number"))
+
+eligible_tasks <- quality_controls %>%
+  filter(participant_code %in% completes$participant_code) %>%
+  group_by(participant_code) %>% filter(n() < 5) %>% ungroup() %>% # Filter for participants with 5 tasks (only the 60 first participants had 5 tasks)
+  group_by(participant_code) %>%
+  mutate(some_exclusion = 
+         ifelse(any(ccei < 0.8, # Flag participants with at least one exclusion criterion (easier to filter for them later)
+                unipref != 0, 
+                minutes_on_experiment <= 5, 
+                minutes_on_experiment >= 120, 
+                comprehension_errors_hidden >= 10), 1, 0)) %>%
+  filter(
+        ccei >= 0.8,
+         unipref == 0,
+         minutes_on_experiment > 5,
+         minutes_on_experiment < 120,
+         comprehension_errors_hidden < 10
+         )
+
+partially_eligible_subjects <- eligible_tasks %>%
+  distinct(participant_code, .keep_all = TRUE) %>%
+  select(!c(task_number, unipref, ccei))
+```
+
+```{r exclusion-reporting}
+# ------------------------------------------------------------------------------
+# Reporting helper for the manuscript exclusion paragraph.
+#
+# IMPORTANT: the criteria are applied in the SAME ORDER as the manuscript
+# (age -> gender -> time -> comprehension -> GARP/CCEI -> unipref). Each
+# percentage is taken over the sample that REMAINS after all earlier criteria,
+# so this is a sequential cascade, not six independent shares. Participant-level
+# criteria (age, gender, time, comprehension) remove a participant and all of
+# their decision blocks; block-level criteria (CCEI, unipref) remove single
+# participant-decision blocks (= goal-pair observations).
+# ------------------------------------------------------------------------------
+report_base <- quality_controls %>%
+  filter(participant_code %in% completes$participant_code) %>%
+  group_by(participant_code) %>% filter(n() < 5) %>% ungroup() %>% # drop the 60 early 5-task pilots
+  left_join(y = survey_data[, c("participant_code", "gender", "age")], by = "participant_code")
+
+n_subj  <- function(d) dplyr::n_distinct(d$participant_code)
+n_block <- function(d) nrow(d)
+
+df <- report_base
+report <- character(0)
+
+# 1. Age < 18 (participant level, reported as a count)
+report <- c(report, sprintf("Age < 18:             %d participants",
+                            n_subj(df %>% filter(age < 18))))
+df <- df %>% filter(age >= 18)
+
+# 2. Gender other than male/female (participant level, count)
+report <- c(report, sprintf("Gender != male/female: %d participants",
+                            n_subj(df %>% filter(!(gender %in% c("male", "female"))))))
+df <- df %>% filter(gender %in% c("male", "female"))
+
+# 3. Time < 5 min or > 2 h (participant level, %)
+den <- n_subj(df)
+bad <- n_subj(df %>% filter(minutes_on_experiment <= 5 | minutes_on_experiment >= 120))
+report <- c(report, sprintf("Time <=5 | >=120 min:  %d / %d participants = %.2f%%", bad, den, 100 * bad / den))
+df <- df %>% filter(minutes_on_experiment > 5, minutes_on_experiment < 120)
+
+# 4. Comprehension errors >= 10 (participant level, %)
+den <- n_subj(df)
+bad <- n_subj(df %>% filter(comprehension_errors_hidden >= 10))
+report <- c(report, sprintf("Comprehension >= 10:   %d / %d participants = %.2f%%", bad, den, 100 * bad / den))
+df <- df %>% filter(comprehension_errors_hidden < 10)
+
+# 5. GARP violation, CCEI < 0.8 (participant-decision-block level, %)
+den <- n_block(df)
+bad <- n_block(df %>% filter(ccei < 0.8))
+report <- c(report, sprintf("CCEI < 0.8 (GARP):     %d / %d blocks = %.2f%%", bad, den, 100 * bad / den))
+df <- df %>% filter(ccei >= 0.8)
+
+# 6. Near-corner allocations, unipref != 0 (goal-pair level, %)
+den <- n_block(df)
+bad <- n_block(df %>% filter(unipref != 0))
+report <- c(report, sprintf("unipref != 0 (>=98%%):  %d / %d goal-pair obs = %.2f%%", bad, den, 100 * bad / den))
+df <- df %>% filter(unipref == 0)
+
+cat(paste(report, collapse = "\n"), "\n")
+cat(sprintf("Remaining eligible (pre-representative-draw): %d participants, %d blocks\n",
+            n_subj(df), n_block(df)))
+```
+
+# Select the sample for the analysis {.hidden .unnumbered .unlisted}
+We oversampled for some countries and genders. For the main analysis we therefore draw a random sample such that we have the have the maximum number of eligible participants but still maintain a representative sample by gender in each country.
+
+```{r}
+# Calculate gender shares based on UN Population Dataset (already reduced to sample countries)
+representative_shares <- read_csv(here::here("1_Data", "1_raw", "UN Population Data", "unpopulation_dataportal_20231016133527.csv")) %>%
+    group_by(Location, Iso2, Sex) %>%
+    summarize(n = sum(Value)) %>%
+    filter(Sex %in% c("Female", "Male")) %>%
+    group_by(Location) %>%
+    mutate(target_share = n/sum(n), Sex = tolower(Sex)) %>%
+    ungroup() %>%
+    rename(gender = Sex, country_abrv = Iso2) %>%
+    mutate(country_abrv = ifelse(country_abrv == "JP", "JA", country_abrv),
+           country_abrv = ifelse(country_abrv == "NG", "NI", country_abrv)) %>%
+    select(country_abrv, gender, target_share)
+
+# Draw a representative (country x gender) random sample from a pool of eligible subjects.
+# `subjects` is one row per eligible participant; `tasks` supplies the participant-task pairs.
+# Refactored into a function so the same draw can be reused for the main sample and for the
+# fully-rational sensitivity sample below.
+draw_representative_sample <- function(subjects, tasks, seed = 123) {
+    # Initiate the sample selection dataset
+    sel <- subjects %>%
+        left_join(y = completes[, c("participant_code", "session_label")], by = c("participant_code")) %>%
+        left_join(y = country_abrv[, c("session_label", "country_abrv")], by = c("session_label")) %>%
+        left_join(y = survey_data[, c("participant_code", "gender", "age")], by = c("participant_code")) %>%
+        filter(age >= 18) %>% # Exclude participants with age < 18 (see the `exclusion-reporting` chunk for counts/percentages)
+        filter(gender == "male" | gender =="female") %>% # Exclude participants with gender other than "Male" / "Female"
+        select(participant_code, country_abrv, gender)
+
+    # Calculate max number of participants to draw from each country and add to dataset
+    sel <- sel %>% # Count total number of eligible participants in each country-gender group
+        group_by(country_abrv, gender) %>%
+        distinct(participant_code) %>%
+        count(name = "completes") %>%
+        left_join(y = representative_shares, by = c("country_abrv", "gender")) %>% # Add target shares
+        group_by(country_abrv) %>% # Calculate the number of participants to draw from each country
+        mutate(country_possible_draw = floor(min(completes/target_share)),
+               to_draw = floor(country_possible_draw*target_share)) %>%
+        ungroup() %>%
+        select(country_abrv, gender, to_draw) %>% # Add to the main dataset
+        right_join(y = sel, by = c("country_abrv", "gender"))
+
+    # Draw the sample
+    set.seed(seed) # Set seed for reproducibility
+    sel %>%
+        group_by(country_abrv, gender) %>%
+        group_modify(~ slice_sample(.x, n = .x$to_draw[1])) %>%
+        ungroup() %>%
+        select(participant_code, country_abrv, gender) %>%
+        left_join(y = tasks[, c("participant_code", "task_number")], by = c("participant_code"))
+}
+
+# Main sample (unchanged): draw from all eligible subjects
+main_sample_selection <- draw_representative_sample(partially_eligible_subjects, eligible_tasks)
+write_csv(main_sample_selection, here::here("1_Data", "2_processed", "main_sample_selection.csv"))
+
+# Fully-rational sensitivity sample: keep only participants without a single excluded block
+fully_rational_subjects <- eligible_tasks %>%
+    filter(some_exclusion == 0) %>%
+    distinct(participant_code, .keep_all = TRUE) %>%
+    select(!c(task_number, unipref, ccei))
+fully_rational_tasks <- eligible_tasks %>% filter(some_exclusion == 0)
+main_sample_selection_fullyrational <- draw_representative_sample(fully_rational_subjects, fully_rational_tasks)
+write_csv(main_sample_selection_fullyrational, here::here("1_Data", "2_processed", "main_sample_selection_fullyrational.csv"))
+
+# Unipref sensitivity sample: same drawn participants as the main sample, but additionally
+# re-include their decision blocks that were excluded solely due to unipref (corner solutions).
+# These blocks still pass CCEI/time/comprehension; only the unipref filter is relaxed.
+eligible_tasks_incl_unipref <- quality_controls %>%
+    filter(participant_code %in% completes$participant_code) %>%
+    group_by(participant_code) %>% filter(n() < 5) %>% ungroup() %>%
+    filter(ccei >= 0.8,
+           minutes_on_experiment > 5,
+           minutes_on_experiment < 120,
+           comprehension_errors_hidden < 10) # unipref intentionally NOT filtered here
+
+main_sample_selection_unipref <- main_sample_selection %>%
+    distinct(participant_code, country_abrv, gender) %>%
+    left_join(y = eligible_tasks_incl_unipref[, c("participant_code", "task_number")], by = c("participant_code"))
+write_csv(main_sample_selection_unipref, here::here("1_Data", "2_processed", "main_sample_selection_unipref.csv"))
+```
