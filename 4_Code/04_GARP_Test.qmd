@@ -1,0 +1,73 @@
+---
+title: "GARP Test"
+format:
+  html:
+    include: false
+    self-contained: true
+execute:
+  freeze: auto
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(readr)
+library(here)
+library(parallel)
+library(doParallel)
+library(foreach)
+```
+
+## Load CCEI programs
+
+```{r load-ccei-programs}
+# Programs from Polisson et al. 2020
+programs_dir <- here("4_Code", "programs_polisson_etal_2020")
+
+source(file.path(programs_dir, "ccei_garp.R"))
+source(file.path(programs_dir, "garp.R"))
+source(file.path(programs_dir, "warshall.R"))
+```
+
+## Prepare data
+
+```{r prepare-decision-blocks, message = FALSE}
+online_decision_tasks <- read_csv(here("1_Data", "2_processed", "Data_decision_task_online.csv"))
+
+garp_input <- online_decision_tasks %>%
+  select(participant_code, block_number, to_goal1, to_goal2, to_goal1_max, to_goal2_max)
+
+# One data frame of choices per participant-decision block
+garp_blocks <- split(garp_input, list(garp_input$participant_code, garp_input$block_number), drop = TRUE)
+```
+
+## Compute CCEI
+
+```{r ccei-function}
+# CCEI of one block; prices are 1 / maximum attainable amount, so every budget line sums to 1
+run_garp <- function(block) {
+  prices <- rbind(1 / block$to_goal2_max, 1 / block$to_goal1_max)
+  quantities <- rbind(block$to_goal2, block$to_goal1)
+  data.frame(participant_code = block$participant_code[1],
+             task_number = block$block_number[1],
+             ccei = ccei_garp(prices, quantities))
+}
+```
+
+```{r ccei-all-blocks}
+# Run in parallel, leaving one core free
+cl <- makeCluster(max(1, detectCores() - 1))
+registerDoParallel(cl)
+
+results_list <- foreach(block = garp_blocks) %dopar% run_garp(block)
+
+stopCluster(cl)
+
+results <- bind_rows(results_list) %>%
+  arrange(participant_code, task_number)
+```
+
+## Export
+
+```{r export-ccei}
+write_csv(results, here("1_Data", "2_processed", "GARP_results_online_sample.csv"))
+```

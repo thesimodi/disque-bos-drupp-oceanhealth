@@ -1,0 +1,98 @@
+---
+title: "Preparation of Decision Data"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(here)
+```
+
+# Import data {.hidden .unnumbered .unlisted}
+
+```{r import-decision-tasks}
+# Decision task files from both survey waves (Bilendi 2023, Dynata 2024)
+decision_files <- c(
+  list.files(here("1_Data", "1_raw", "2023_11_Bilendi"), pattern = "decision_block_", full.names = TRUE),
+  list.files(here("1_Data", "1_raw", "2024_12_Dynata"), pattern = "decision_block_", full.names = TRUE)
+)
+
+decision_tasks <- read_csv(decision_files, col_types = cols(participant_label = col_character()))
+```
+
+```{r import-completes}
+# Participants who completed the survey
+completes <- read_csv(
+  c(here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_sl12.csv"),
+    here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_fl.csv"),
+    here("1_Data", "1_raw", "2024_12_Dynata", "Completes_fl2.csv")),
+  col_types = cols(participant_label = col_character())
+)
+```
+
+```{r keep-completes}
+# Lower-case session labels ("Indonesia" vs "indonesia") so the join matches
+completes$session_label <- tolower(completes$session_label)
+decision_tasks$session_label <- tolower(decision_tasks$session_label)
+
+# Drop participants who did not complete the survey
+decision_tasks <- inner_join(decision_tasks, completes, by = c("participant_label", "session_label"))
+```
+
+# Data prep {.hidden .unnumbered .unlisted}
+
+```{r rename-columns}
+decision_tasks <- decision_tasks %>%
+  mutate(price_of_redist = to_goal_1_max / to_goal_2_max) %>%
+  rename(to_goal1 = to_goal_1,
+         to_goal2 = to_goal_2,
+         to_goal1_max = to_goal_1_max,
+         to_goal2_max = to_goal_2_max)
+```
+
+```{r goal-pairs}
+# Goal codes are only recorded in the first round of a block: fill them down
+decision_tasks <- decision_tasks %>%
+  group_by(participant_code) %>%
+  fill(goal1_code, goal2_code, .direction = "down") %>%
+  ungroup() %>%
+  mutate(goal_pair = paste0(goal1_code, "-", goal2_code), .after = goal2_code) %>%
+  arrange(session_label, participant_label)
+```
+
+```{r block-numbers}
+# Block number = alphabetical rank of the goal pair within a participant (not the order played)
+decision_tasks <- decision_tasks %>%
+  group_by(participant_label) %>%
+  mutate(block_number = dense_rank(goal_pair)) %>%
+  ungroup()
+```
+
+```{r budget-shares}
+# Prices and budget shares per goal (input for the Matlab estimation)
+decision_tasks <- decision_tasks %>%
+  mutate(price_goal1 = 1 / to_goal1_max,
+         price_goal2 = 1 / to_goal2_max,
+         price_ratio = price_goal1 / price_goal2,
+         to_goal1_p = to_goal1 * price_goal1 / (to_goal1_max * price_goal1),  # expenditure / budget
+         to_goal2_p = to_goal2 * price_goal2 / (to_goal2_max * price_goal2))
+```
+
+```{r participant-id}
+# Numeric participant id
+decision_tasks <- decision_tasks %>%
+  group_by(participant_label) %>%
+  mutate(id = cur_group_id(), .before = participant_label) %>%
+  ungroup()
+```
+
+# Export {.hidden .unnumbered .unlisted}
+
+```{r export}
+write_csv(decision_tasks, here("1_Data", "2_processed", "Data_decision_task_online.csv"))
+```

@@ -1,0 +1,74 @@
+---
+title: "Preparation of Survey Data"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(readr)
+library(here)
+```
+
+## Import survey data
+
+```{r import-survey-data, message = FALSE}
+# Read and stack the three survey files
+survey_sl  <- read_csv(here("1_Data", "1_raw", "2023_11_Bilendi", "Data_survey_sl12.csv"))
+survey_fl  <- read_csv(here("1_Data", "1_raw", "2023_11_Bilendi", "Data_survey_fl.csv"))
+survey_fl2 <- read_csv(here("1_Data", "1_raw", "2024_12_Dynata", "Data_survey_fl2.csv"))
+online_survey <- rbind(survey_sl, survey_fl, survey_fl2)
+
+# Lowercase session labels (raw data mixes e.g. "Indonesia" and "indonesia")
+online_survey$session_label <- tolower(online_survey$session_label)
+```
+
+## Keep completed responses
+
+```{r keep-completes, message = FALSE}
+# Read and stack the lists of completed participants
+complete_sl  <- read_csv(here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_sl12.csv"))
+complete_fl  <- read_csv(here("1_Data", "1_raw", "2023_11_Bilendi", "Completes_fl.csv"))
+complete_fl2 <- read_csv(here("1_Data", "1_raw", "2024_12_Dynata", "Completes_fl2.csv"))
+completes <- rbind(complete_sl, complete_fl, complete_fl2)
+
+# Drop one complete that has no record in the survey data
+completes <- filter(completes, participant_label != "FoOQRsEjNNlezhTpJJy4YA**")
+
+# Keep only survey responses of completed participants
+online_survey <- right_join(online_survey, select(completes, participant_label),
+                            by = "participant_label")
+```
+
+## Recode variables
+
+```{r recode-variables}
+# Answer "more than 10" is stored as 99; recode to 11 (as stated in the SI)
+online_survey$siblings[online_survey$siblings == 99] <- 11
+online_survey$number_moves[online_survey$number_moves == 99] <- 11
+online_survey$days_at_sea[online_survey$days_at_sea == 99] <- 11
+
+# Replace numeric answer codes by labels
+online_survey$gender <- factor(online_survey$gender,
+                               levels = 1:5,
+                               labels = c("male", "female", "non-binary", "n/a", "other"))
+
+online_survey$ocean_health_importance <- factor(online_survey$ocean_health_importance,
+                                                levels = 0:7,
+                                                labels = c("no opinion",
+                                                           "not important at all",
+                                                           "not important",
+                                                           "rather not important",
+                                                           "undecided",
+                                                           "rather important",
+                                                           "important",
+                                                           "very important"))
+```
+
+## Save processed data
+
+```{r save-data}
+write_csv(online_survey, here("1_Data", "2_processed", "Data_online_survey.csv"))
+```

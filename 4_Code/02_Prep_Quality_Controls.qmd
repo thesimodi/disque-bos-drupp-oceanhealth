@@ -1,0 +1,68 @@
+---
+title: "Preparation of Quality Controls"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(here)
+```
+
+## Load raw data {.hidden .unnumbered .unlisted}
+```{r load_raw_data, message = FALSE}
+# Launches: soft-launches 1+2 (sl12) and full launch (fl) by Bilendi, full launch by Dynata (fl2)
+launches <- c("sl12", "fl", "fl2")
+raw_folders <- here("1_Data", "1_raw", c("2023_11_Bilendi", "2023_11_Bilendi", "2024_12_Dynata"))
+
+# Read and stack the files of all launches
+page_times <- read_csv(file.path(raw_folders, paste0("PageTimes_", launches, ".csv")))
+intro <- read_csv(file.path(raw_folders, paste0("Data_intro_", launches, ".csv")),
+                  col_select = c(participant_code, `_current_page_name`))
+training <- read_csv(file.path(raw_folders, paste0("Data_training_", launches, ".csv")),
+                     col_select = c(participant_code, total_number_errors_hidden, comprehension_errors_hidden))
+```
+
+## Keep participants who reached the final page {.hidden .unnumbered .unlisted}
+```{r keep_complete_participants}
+complete_codes <- intro %>%
+  filter(`_current_page_name` == "P03_Thank_You") %>%
+  pull(participant_code)
+
+page_times <- page_times %>% filter(participant_code %in% complete_codes)
+training <- training %>% filter(participant_code %in% complete_codes)
+```
+
+## Time spent on each page {.hidden .unnumbered .unlisted}
+```{r time_per_page}
+# epoch_time is when a page was submitted, so the gap to the next submit is the time spent on the next page
+page_times <- page_times %>%
+  arrange(participant_code, epoch_time) %>%
+  group_by(participant_code, session_code) %>%
+  mutate(time_on_page = lead(epoch_time) - epoch_time) %>%
+  ungroup()
+```
+
+## Time spent on the experiment {.hidden .unnumbered .unlisted}
+```{r time_per_participant}
+experiment_apps <- c("intro", "training_task", paste0("decision_block_", 1:5), "survey")
+
+# Total time = last submit minus P0_Intro submit (rows without an app, e.g. Dynata's InitializeParticipant, are dropped)
+time_per_participant <- page_times %>%
+  filter(app_name %in% experiment_apps) %>%
+  group_by(participant_code, session_code) %>%
+  summarize(seconds_on_experiment = sum(time_on_page, na.rm = TRUE),
+            minutes_on_experiment = seconds_on_experiment / 60,
+            pages_seen = n(),
+            .groups = "drop")
+```
+
+## Save quality controls {.hidden .unnumbered .unlisted}
+```{r save_quality_controls}
+quality_controls <- time_per_participant %>%
+  inner_join(training, by = "participant_code")
+
+write_csv(quality_controls, here("1_Data", "2_processed", "Quality_Controls.csv"))
+```

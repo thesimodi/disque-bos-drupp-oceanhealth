@@ -1,0 +1,2358 @@
+---
+title: "All Figures"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+# Setup
+
+```{r setup, warning = FALSE, message = FALSE}
+library(broom)
+library(BSDA)
+library(cowplot)
+library(DescTools)
+library(dplyr)
+library(gghalves)
+library(ggplot2)
+library(ggrepel)
+library(ggthemes)
+library(here)
+library(kableExtra)
+library(latex2exp)
+library(quantreg)
+library(readr)
+library(stringr)
+library(tidyr)
+library(rnaturalearth)
+library(ggpp)
+
+options(knitr.kable.NA = '-')
+```
+
+# Import data
+
+```{r import-data, message = FALSE}
+data_decision_task_online_raw <- read_csv(here("1_Data", "2_processed", "Data_decision_task_online.csv"))
+ohi_estimates_online_raw <- read_csv(here("1_Data", "2_processed", "Matlab_Results_OHI_online.csv")) %>%
+    na.omit() # Drop blocks with missing estimates
+ohi_scores <- read_csv(here("1_Data", "1_raw", "OHI_Scores_2024", "scores.csv"))
+survey_data <- read_csv(here("1_Data", "2_processed", "Data_online_survey.csv"))
+main_sample_subject_selection <- read_csv(here("1_Data", "2_processed", "main_sample_selection.csv"))
+
+# Goal codes and names (German codes are used in the experimental data)
+goal_names <- tribble(
+  ~goal_code,  ~goal_name, ~goal_code_eng, ~goal_name_eng,
+  "OV", "Ortsverbundenheit", "SP", "Sense of Place",
+  "SG", "Saubere Gewässer", "CW", "Clean Waters",
+  "SdK", "Schutz der Küstengebiete", "CP", "Coastal Protection",
+  "NV", "Nahrungsversorgung", "FP", "Food Provision",
+  "TuE", "Tourismus und Erholung", "TR", "Tourism and Recreation",
+  "BD", "Biodiversität", "BD", "Biodiversity",
+  "LuW", "Lebensunterhalt und Wirtschaft an der Küste", "LE", "Livelihoods and Economies",
+  "NP", "Natürliche Produkte", "NP", "Natural Products",
+  "MtF", "Möglichkeiten zur traditionellen Fischerei", "AO", "Artisanal Fishing Opportunities",
+  "KS", "Kohlenstoffspeicherung" , "CS", "Carbon Storage"
+)
+goals <- goal_names$goal_code_eng
+german_to_english <- setNames(goal_names$goal_code_eng, goal_names$goal_code)
+
+# Keep the officially reported "Global average" scores aside (SI Appendix Tab. S2); all analyses use countries only
+ohi_scores_global_average <- ohi_scores %>% filter(region_name == "Global average")
+ohi_scores <- ohi_scores %>% filter(region_name != "Global average")
+
+# The OHI reports no TR scores for Japan and Australia but the OHI website shows 100 for all years up to 2022
+tr_imputed_countries <- c("Japan", "Australia")
+
+# Survey countries with their country codes and session labels
+country_codes <- tribble(
+  ~country_abrv, ~session_label, ~region_name,
+  "ID", "indonesia", "Indonesia",
+  "CA", "canada", "Canada",
+  "AU", "australia", "Australia",
+  "CN", "china", "China",
+  "FR", "france", "France",
+  "DE", "germany", "Germany",
+  "IN", "india", "India",
+  "JP", "japan", "Japan",
+  "NG", "nigeria", "Nigeria",
+  "PE", "peru", "Peru",
+  "PH", "philippines", "Philippines",
+  "US", "usa" , "United States"
+)
+sample_countries <- country_codes$region_name
+
+# Merge the English and French Canadian sessions
+data_decision_task_online_raw <- data_decision_task_online_raw %>%
+    mutate(session_label = ifelse(session_label %in% c("canada-en", "canada-fr"), "canada", session_label))
+survey_data <- survey_data %>%
+    mutate(session_label = ifelse(session_label %in% c("canada-en", "canada-fr"), "canada", session_label))
+```
+
+# Plot themes
+
+```{r themes}
+# Base theme of all figures
+theme_basic <- theme_economist() + theme(
+    panel.background = element_blank(),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major.y = element_line(color = "lightgray", linewidth = 0.5),
+    axis.text.y = element_text(hjust = 1), # Align y-tick labels to the right
+    axis.title.y = element_text(margin = margin(r = 5)), # Increase distance between y-axis label and ticks
+    legend.background = element_blank()
+    )
+
+# Black axis lines and ticks without horizontal grid lines, used by most panels
+theme_axes <- theme(
+    axis.line.x = element_line(colour = "black", linewidth = 0.3),
+    axis.line.y = element_line(colour = "black", linewidth = 0.3),
+    axis.ticks.x = element_line(color = "black", linewidth = 0.3),
+    axis.ticks.y = element_line(color = "black", linewidth = 0.3),
+    axis.ticks.length = unit(0.1, "cm"),
+    panel.grid.major.y = element_blank()
+    )
+
+# Colours of the goals
+goal_colors <- c(
+    "FP" = "#98234A",
+    "AO" = "#EC6A5A",
+    "NP" = "#F07E58",
+    "CS" = "#F39A67",
+    "CP" = "#F6B376",
+    "LE" = "#EFE498",
+    "TR" = "#FAD08A",
+    "SP" = "#A7D6A8",
+    "CW" = "#53A9B2",
+    "BD" = "#4289BB"
+)
+```
+
+# Helper functions
+
+```{r helper-functions}
+## Participant-level data and clustered inference
+# The decision blocks of a participant are not independent; these helpers are used by every test that would otherwise
+# treat them as independent observations (see SI Appendix Tab. S3)
+
+# One observation per participant: eta_n, the median of the participant's block-level estimates eta_ng.
+# Further grouping variables (participant characteristics) are kept.
+to_participant_level <- function(data, ...) {
+    data %>%
+        group_by(participant_code, ...) %>%
+        summarise(eta = median(eta), .groups = "drop")
+}
+
+# Coefficient table of an lm() fit with cluster-robust (CR1) standard errors and a t distribution with G - 1 degrees
+# of freedom (G = number of clusters)
+cluster_robust_coefs <- function(model, cluster) {
+    X <- model.matrix(model)
+    stopifnot(nrow(X) == length(cluster)) # Clusters must align with the observations used in the fit
+    n <- nrow(X)
+    k <- ncol(X)
+    G <- n_distinct(cluster)
+    bread <- solve(crossprod(X))
+    meat <- crossprod(rowsum(X * residuals(model), cluster))
+    se <- sqrt(diag(G / (G - 1) * (n - 1) / (n - k) * bread %*% meat %*% bread))
+    tibble(term = colnames(X),
+           estimate = unname(coef(model)),
+           std.error = unname(se),
+           statistic = estimate / std.error,
+           p.value = 2 * pt(-abs(statistic), df = G - 1),
+           conf.low = estimate - qt(0.975, df = G - 1) * std.error,
+           conf.high = estimate + qt(0.975, df = G - 1) * std.error,
+           n_obs = n,
+           n_clusters = G)
+}
+
+# Participant (cluster) bootstrap: draw participants with replacement and keep all of their decision blocks. Each draw
+# gets a new participant id, so that a participant drawn twice enters as two clusters in a nested resample.
+resample_participants <- function(data) {
+    rows <- split(seq_len(nrow(data)), data$participant_code)
+    drawn <- sample.int(length(rows), length(rows), replace = TRUE)
+    resample <- data[unlist(rows[drawn], use.names = FALSE), , drop = FALSE]
+    resample$participant_code <- rep(seq_along(drawn), lengths(rows[drawn]))
+    resample
+}
+
+## Goal weights from the pairwise comparisons
+retrieve_alphas <- function(dataset) {
+    # Drop rows without alpha (synthetic balancing rows) and use the English goal codes
+    dataset <- na.omit(dataset) %>%
+        mutate(task_name = str_replace_all(task_name, pattern = german_to_english))
+
+    # Median weight per goal pair, pooling both orderings of the goals and expressed as the weight on goal_i, the
+    # alphabetically first goal of the pair
+    median_estimates <- dataset %>%
+        separate_wider_delim(task_name, delim = "-", names = c("goal1", "goal2")) %>%
+        mutate(goal_i = pmin(goal1, goal2),
+               goal_j = pmax(goal1, goal2),
+               alpha_i = ifelse(goal1 == goal_i, alpha, 1 - alpha)) %>%
+        group_by(goal_i, goal_j) %>%
+        summarize(median_alpha = median(alpha_i, na.rm = TRUE), .groups = "drop")
+
+    stopifnot("Every goal pair needs a median alpha strictly between 0 and 1" =
+                  nrow(median_estimates) == choose(length(goals), 2) &&
+                  all(median_estimates$median_alpha > 0 & median_estimates$median_alpha < 1))
+
+    # Reciprocal matrix of alpha ratios: c_ij = m_ij / (1 - m_ij) and c_ji = 1 / c_ij
+    alpha_ratio_mat <- matrix(1, nrow = length(goals), ncol = length(goals), dimnames = list(goals, goals))
+    alpha_ratio_mat[cbind(median_estimates$goal_i, median_estimates$goal_j)] <- median_estimates$median_alpha / (1 - median_estimates$median_alpha)
+    alpha_ratio_mat[cbind(median_estimates$goal_j, median_estimates$goal_i)] <- (1 - median_estimates$median_alpha) / median_estimates$median_alpha
+
+    # Logarithmic least-squares weights (Hovanov et al. 2008): geometric mean of each row, normalized to sum to 1
+    alpha_weights <- apply(alpha_ratio_mat, 1, function(ratios) exp(mean(log(ratios))))
+    alpha_weights <- alpha_weights / sum(alpha_weights)
+
+    tibble(goal = names(alpha_weights), alpha_median = as.numeric(alpha_weights))
+}
+
+## Index score from goal scores
+# CES aggregation (sum_i alpha_i x_i^(1 - eta))^(1 / (1 - eta)), with the geometric mean for eta = 1. eta is the same
+# for all goals of a country, so only its first value is used.
+calculate_OHI_score <- function(alpha_vector, score_vector, eta) {
+    eta <- eta[1]
+    if (eta == 1) return(prod(score_vector^alpha_vector)^(1 / sum(alpha_vector)))
+    sum(alpha_vector * score_vector^(1 - eta))^(1 / (1 - eta))
+}
+
+## Merge survey answers
+# Codes "ocean health importance" from 1 (not important at all) to 7 (very important), dropping "no opinion"
+importance_levels <- c("not important at all", "not important", "rather not important", "undecided",
+                       "rather important", "important", "very important")
+add_survey_data <- function(data) {
+    data %>%
+        inner_join(survey_data %>% select(participant_code, gender, age, days_at_sea, ocean_health_importance, session_label),
+                   by = "participant_code", multiple = "any") %>%
+        filter(ocean_health_importance != "no opinion") %>%
+        mutate(ocean_health_importance = match(ocean_health_importance, importance_levels),
+               gender = factor(gender, levels = c("male", "female")))
+}
+```
+
+# Sample preparation
+
+```{r compute-prep}
+# Computes all objects that depend on the sample selection: the selected decision blocks with their (alpha, eta)
+# estimates, overall and country-level preferences, and OHI_table (one row per country and goal, with baseline and
+# adjusted OHI scores). Used for the main sample and the sensitivity samples of SI Appendix Fig. S8:
+#   unipref_eta: re-include the corner-solution blocks with alpha = 1 or 0 and this fixed eta
+#   synthetic_fill: fill every participant up to three decision blocks
+compute_prep <- function(sample_selection, unipref_eta = NULL, synthetic_fill = FALSE) {
+    ## Selected decision blocks
+    selected_blocks <- paste(sample_selection$participant_code, sample_selection$task_number)
+    stopifnot(all(selected_blocks %in% paste(ohi_estimates_online_raw$participant_code, ohi_estimates_online_raw$task_number))) # No selected block missing from estimates
+    data_decision_task_online <- data_decision_task_online_raw %>% filter(paste(participant_code, block_number) %in% selected_blocks)
+    ohi_estimates_online <- ohi_estimates_online_raw %>% filter(paste(participant_code, task_number) %in% selected_blocks)
+
+    ## Corner solutions (unipref sensitivity only)
+    # alpha = 1 if goal 1 got more than half of the points on average, else 0; eta is fixed at unipref_eta
+    if (!is.null(unipref_eta)) {
+        dominant_goal_alpha <- data_decision_task_online %>%
+            group_by(participant_code, block_number) %>%
+            summarise(share_goal1 = mean(to_goal1 / (to_goal1 + to_goal2), na.rm = TRUE), .groups = "drop") %>%
+            transmute(participant_code, task_number = block_number, assigned_alpha = ifelse(share_goal1 > 0.5, 1, 0))
+        ohi_estimates_online <- ohi_estimates_online %>%
+            left_join(dominant_goal_alpha, by = c("participant_code", "task_number")) %>%
+            mutate(alpha = ifelse(!is.na(unipref) & unipref != 0, assigned_alpha, alpha),
+                   eta   = ifelse(!is.na(unipref) & unipref != 0, unipref_eta, eta)) %>%
+            select(-assigned_alpha)
+    }
+
+    ## Synthetic balancing (sensitivity only)
+    # Add rows without alpha that carry the participant's mean eta until every participant has three decision blocks
+    if (synthetic_fill) {
+        ohi_estimates_online <- ohi_estimates_online %>%
+            nest(blocks = -participant_code) %>%
+            mutate(blocks = purrr::map(blocks, function(participant_blocks) {
+                n_missing <- 3 - nrow(participant_blocks)
+                if (n_missing <= 0) return(participant_blocks)
+                synthetic_rows <- participant_blocks %>%
+                    slice(rep(1, n_missing)) %>%
+                    mutate(eta = mean(participant_blocks$eta, na.rm = TRUE), task_number = NA, alpha = NA, task_name = NA,
+                           rho = NA, sigma = NA, nllsq_alpha = NA, unipref = NA)
+                bind_rows(participant_blocks, synthetic_rows)
+            })) %>%
+            unnest(blocks)
+    }
+
+    ## Overall preferences
+    ohi_estimates_online_eng <- ohi_estimates_online %>% mutate(task_name = str_replace_all(task_name, pattern = german_to_english))
+    alpha_total_sample <- retrieve_alphas(ohi_estimates_online)
+    eta_total_sample <- median(ohi_estimates_online$eta)
+
+    ## Country-level preferences
+    estimates_wcountry <- ohi_estimates_online %>%
+        inner_join(distinct(data_decision_task_online, participant_code, session_label), by = "participant_code") %>%
+        inner_join(country_codes, by = "session_label") %>%
+        select(-session_label)
+
+    # Goal weights per country
+    alpha_per_country <- tibble()
+    for (survey_country in unique(estimates_wcountry$region_name)) {
+        alpha_country <- retrieve_alphas(filter(estimates_wcountry, region_name == survey_country)) %>%
+            mutate(region_name = survey_country)
+        alpha_per_country <- bind_rows(alpha_per_country, alpha_country)
+    }
+
+    # Median eta per country
+    eta_per_country <- estimates_wcountry %>%
+        summarise(eta_median = median(eta), .by = country_abrv)
+
+    ## OHI_table: goal scores, preferences and adjusted scores per country in 2022
+    base_OHI_2022 <- ohi_scores %>%
+        filter(scenario == 2022, goal == "Index", dimension == "score", !is.na(value)) %>%
+        select(country = region_name, base_OHI = value)
+
+    OHI_table <- ohi_scores %>%
+        filter(scenario == 2022, goal %in% goals, dimension == "score") %>%
+        arrange(goal) %>%
+        mutate(value = ifelse(region_name %in% tr_imputed_countries & goal == "TR", 100, value)) %>%
+        group_by(region_name) %>%
+        filter(!any(is.na(value))) %>% # Drop countries with a missing goal score
+        ungroup() %>%
+        transmute(country_code = country_codes$country_abrv[match(region_name, country_codes$region_name)],
+                  country = region_name,
+                  goal,
+                  goal_score = value) %>%
+        left_join(alpha_per_country, by = c("goal", "country" = "region_name")) %>%
+        left_join(eta_per_country, by = c("country_code" = "country_abrv")) %>%
+        # Countries outside the survey get the overall preferences
+        mutate(alpha_global = alpha_total_sample$alpha_median[match(goal, alpha_total_sample$goal)],
+               alpha_median = ifelse(is.na(alpha_median), alpha_global, alpha_median),
+               eta_median = ifelse(is.na(eta_median), eta_total_sample, eta_median)) %>%
+        left_join(base_OHI_2022, by = "country") %>%
+        group_by(country) %>%
+        mutate(
+            # The official index of the TR-imputed countries averages only 9 goals: use the mean of all 10 goal scores
+            base_OHI = ifelse(country %in% tr_imputed_countries, mean(goal_score), base_OHI),
+            # Adjusted scores with the country preferences
+            adjusted_OHI = calculate_OHI_score(alpha_median, goal_score, eta_median),
+            # Adjusted scores with the overall preferences for all countries: weights and eta, weights only, eta only
+            adjusted_OHI_global = calculate_OHI_score(alpha_global, goal_score, eta_total_sample),
+            adjusted_OHI_alphaonly = calculate_OHI_score(alpha_global, goal_score, 0),
+            adjusted_OHI_etaonly = calculate_OHI_score(rep(0.1, 10), goal_score, eta_total_sample)) %>%
+        ungroup() %>%
+        arrange(country)
+
+    list(data_decision_task_online = data_decision_task_online,
+         ohi_estimates_online = ohi_estimates_online,
+         ohi_estimates_online_eng = ohi_estimates_online_eng,
+         alpha_total_sample = alpha_total_sample,
+         eta_total_sample = eta_total_sample,
+         estimates_wcountry = estimates_wcountry,
+         eta_per_country = eta_per_country,
+         OHI_table = OHI_table)
+}
+```
+
+```{r main-sample}
+main_prep <- compute_prep(main_sample_subject_selection)
+list2env(main_prep, envir = globalenv())
+
+# One row per country, with the Gini coefficient of its goal scores
+country_scores <- OHI_table %>%
+    group_by(country) %>%
+    mutate(gini = Gini(goal_score)) %>%
+    ungroup() %>%
+    distinct(country, .keep_all = TRUE)
+```
+
+# Plot functions
+
+```{r plot-functions}
+## Fig. 2a: goal weights, optionally with confidence intervals
+plot_goal_weights <- function(weights_data, alpha_ci = NULL) {
+    # With confidence intervals, TR's bar is too narrow for both labels: show its point estimate above the bar
+    goals_label_above <- if (is.null(alpha_ci)) character(0) else "TR"
+
+    panel <- ggplot(weights_data, aes(x = goal, y = alpha_median, fill = goal)) +
+        geom_bar(stat = "identity") +
+        scale_fill_manual(values = goal_colors) +
+        geom_hline(yintercept = 0.1, linetype = "dashed", color = "black", linewidth = 0.3) +
+        geom_text(aes(label = round(alpha_median, 3), vjust = ifelse(goal %in% goals_label_above | alpha_median >= 0.1, -0.5, 1.5)), size = 6 /.pt) +
+        geom_text(aes(label = paste0("n=", n), y = 0.023), angle = 90, vjust = 1.5, color = "black", size = 6 /.pt) +
+        labs(x = "Goal", y = expression(paste("Weighting estimate (", alpha, ")"))) +
+        annotate(geom = "text", label = "Equal weighting (1/N)", y = 0.11, x = 8.8, size = 7 /.pt) +
+        scale_y_continuous(limits = c(0, max(weights_data$alpha_median, 0.2)), breaks = c(0, 0.05, 0.1, 0.15, 0.2), expand = c(0, 0)) +
+        theme_basic +
+        theme_axes +
+        theme(legend.position = "none",
+              axis.text.x = element_text(vjust = 7, size = 7),
+              axis.text.y = element_text(hjust = 0, size = 7, margin = margin(r = 2)),
+              axis.ticks.x = element_blank(),
+              axis.title.y = element_text(size = 7),
+              axis.title.x = element_text(size = 7, vjust = 3))
+
+    if (!is.null(alpha_ci)) {
+        goal_order <- as.character(weights_data$goal)
+        ci_labels <- tibble(goal = weights_data$goal,
+                            label = sprintf("[%.3f, %.3f]", alpha_ci[1, goal_order], alpha_ci[2, goal_order]))
+        panel <- panel +
+            geom_text(data = ci_labels, aes(x = goal, y = 0.025, label = label),
+                      angle = 90, hjust = 0.35, vjust = -0.5, size = 5 / .pt, inherit.aes = FALSE)
+    }
+    panel
+}
+
+## Fig. 2b and 2d: paired dot plot of baseline vs. adjusted country scores
+# Long format with jittered x positions; scores has one row per country with base_OHI and adjusted_OHI
+jitter_scores_long <- function(scores) {
+    scores_long <- scores %>%
+        select(country, base_OHI, adjusted_OHI) %>%
+        pivot_longer(cols = c(base_OHI, adjusted_OHI), names_to = "name", values_to = "value") %>%
+        mutate(x = ifelse(name == "base_OHI", 1, 2))
+    scores_long$jittered_x <- jitter(scores_long$x, .1)
+    scores_long
+}
+
+# Plot with the mean change and the p-value of a paired t-test; with ci_label, the CI is shown between the two
+plot_score_shift <- function(scores_long, adjusted_name, adjusted_color, label_y, ci_label = NULL) {
+    baseline <- scores_long$value[scores_long$x == 1]
+    adjusted <- scores_long$value[scores_long$x == 2]
+    mean_change <- (mean(adjusted, na.rm = TRUE) - mean(baseline, na.rm = TRUE)) / mean(baseline, na.rm = TRUE) * 100
+    p_value <- t.test(baseline, adjusted, paired = TRUE)$p.value
+    p_label <- paste0("(", ifelse(p_value < 0.001, "p<0.001", sprintf("p=%.3f", p_value)), ")")
+
+    panel <- ggplot(data = scores_long, aes(y = value)) +
+        geom_point(data = filter(scores_long, x == 1), aes(x = jittered_x), color = "#D55E00", size = 0.3, alpha = .5) +
+        geom_point(data = filter(scores_long, x == 2), aes(x = jittered_x), color = adjusted_color, size = 0.3, alpha = .5) +
+        geom_line(aes(x = jittered_x, group = country), color = 'lightgray', alpha = .5, linewidth = 0.1) +
+        geom_half_boxplot(
+            data = filter(scores_long, x == 1), aes(x = x, y = value), position = position_nudge(x = 1.25),
+            side = "r", outlier.shape = NA, center = TRUE, errorbar.draw = TRUE, width = .07,
+            alpha = .5, size = 0.2, fill = "#D55E00") +
+        geom_half_boxplot(
+            data = filter(scores_long, x == 2), aes(x = x, y = value), position = position_nudge(x = .3),
+            side = "r", outlier.shape = NA, center = TRUE, errorbar.draw = TRUE, width = .07,
+            alpha = .5, size = 0.2, fill = adjusted_color) +
+        geom_half_violin(
+            data = filter(scores_long, x == 2), aes(x = x, y = value), position = position_nudge(x = .05),
+            side = "r", alpha = .5, trim = TRUE, size = 0.2, adjust = 0.6, width = 0.3, fill = adjusted_color) +
+        geom_half_violin(
+            data = filter(scores_long, x == 1), aes(x = x, y = value), position = position_nudge(x = 1.05),
+            side = "r", alpha = .5, trim = TRUE, size = 0.2, adjust = 0.6, width = 0.3, fill = "#D55E00") +
+        scale_x_continuous(breaks = c(1, 2), labels = c("Baseline country scores", paste(adjusted_name, "country scores"))) +
+        scale_y_continuous(breaks = seq(0, 95, 10)) +
+        xlab("") + ylab("OHI score") +
+        theme_classic() +
+        coord_cartesian(xlim = c(0.9, 2.6), ylim = c(0, 90)) +
+        theme(
+            axis.title = element_text(size = 7),
+            axis.text = element_text(size = 7),
+            axis.text.y = element_text(angle = 0, hjust = 1),
+            axis.line.x = element_line(colour = "black", linewidth = 0.3),
+            axis.line.y = element_line(colour = "black", linewidth = 0.3),
+            plot.margin = margin(t = 2, r = 2, b = 2, l = 2, unit = "pt"))
+
+    if (is.null(ci_label)) {
+        panel + annotate("text", x = 2.50, y = label_y, label = paste(paste0(round(mean_change, 0), "%"), p_label, sep = "\n"), size = 7 /.pt)
+    } else {
+        panel +
+            annotate("text", x = 2.515, y = label_y + 2, label = sprintf("%.1f%%", mean_change), size = 6 / .pt) +
+            annotate("text", x = 2.515, y = label_y - 5, label = ci_label, size = 6 / .pt) +
+            annotate("text", x = 2.515, y = label_y - 12, label = p_label, size = 6 / .pt)
+    }
+}
+
+## Fig. 2e and SI Appendix Figs. S4, S8, S11: densities of baseline vs. adjusted country scores
+# d has one row per country with base_OHI and adjusted_OHI; pct_x positions the %-change label. With ci_label, the
+# %-change is shown with one decimal and the CI below it.
+plot_ohi_density_panel <- function(d, panel_title = NULL, pct_x = 63, ci_label = NULL, pct_hjust = 0) {
+    panel <- ggplot() +
+        geom_density(data = d, aes(x = base_OHI), color = "#D55E00", fill = "#D55E00", alpha = 0.4) +
+        geom_density(data = d, aes(x = adjusted_OHI), color = "#009E73", fill = "#009E73", alpha = 0.4) +
+        # Mean baseline and adjusted scores
+        geom_segment(data = d, aes(x = mean(base_OHI), xend = mean(base_OHI), y = 0, yend = 0.1, color = "Baseline", linetype = "Mean"), linewidth = 0.3) +
+        geom_text(data = d, aes(x = mean(base_OHI), y = 0.1, label = round(mean(base_OHI), 0)), vjust = -0.5, hjust = 0.5, size = 7 /.pt, check_overlap = TRUE) +
+        geom_segment(data = d, aes(x = mean(adjusted_OHI), xend = mean(adjusted_OHI), y = 0, yend = 0.1, color = "Adjusted", linetype = "Mean"), linewidth = 0.3) +
+        geom_text(data = d, aes(x = mean(adjusted_OHI), y = 0.1, label = round(mean(adjusted_OHI), 0)), vjust = -0.5, hjust = 0.7, size = 7 /.pt, check_overlap = TRUE) +
+        # Arrow between the means
+        geom_segment(data = d, aes(x = mean(adjusted_OHI), xend = mean(base_OHI), y = 0.095, yend = 0.095),
+                     arrow = arrow(length = unit(0.1, "cm"), ends = "first", type = "open", angle = 30), linewidth = 0.2)
+
+    # %-change of the mean score
+    if (is.null(ci_label)) {
+        panel <- panel +
+            geom_text(data = d, aes(x = pct_x, y = 0.096, label = paste0(round((1 - mean(adjusted_OHI) / mean(base_OHI)) * -100), "%")),
+                      vjust = 0, hjust = pct_hjust, size = 7 /.pt, check_overlap = TRUE)
+    } else {
+        pct_change <- (mean(d$adjusted_OHI) - mean(d$base_OHI)) / mean(d$base_OHI) * 100
+        panel <- panel +
+            annotate("text", x = pct_x, y = 0.096, vjust = 0, hjust = 0, size = 7 / .pt, label = sprintf("%.1f%%", pct_change)) +
+            annotate("text", x = pct_x - 3, y = 0.091, label = ci_label, size = 7 / .pt, hjust = 0)
+    }
+
+    panel +
+        labs(x = "OHI score", y = "Density", title = panel_title) +
+        scale_x_continuous(limit = c(0, 100), expand = c(0, 0), breaks = seq(0, 100, 10)) +
+        scale_y_continuous(limit = c(0, 0.11), expand = c(0, 0)) +
+        scale_color_manual(breaks = c("Baseline", "Adjusted"), values = c("Baseline" = "#D55E00", "Adjusted" = "#009E73")) +
+        scale_linetype_manual(breaks = c("Median", "Mean"), values = c("Median" = "solid", "Mean" = "dashed")) +
+        theme_basic +
+        theme_axes +
+        theme(
+            plot.title = element_text(size = 8, hjust = 0.5, margin = margin(b = 2)),
+            legend.position = "inside",
+            legend.position.inside = c(0.13, 0.62),
+            legend.background = element_blank(),
+            legend.title = element_blank(),
+            legend.text = element_text(size = 7),
+            legend.spacing.x = unit(0, "mm"),
+            legend.spacing.y = unit(-3, "mm"),
+            legend.key.height = unit(0.6, "lines"),
+            axis.text.x = element_text(angle = 0, vjust = 6, size = 7),
+            axis.text.y = element_text(hjust = 0, size = 7, margin = margin(r = 2)),
+            plot.margin = unit(c(0, 0, 0, 0), "cm"),
+            axis.title.x = element_text(size = 7),
+            axis.title.y = element_text(size = 7))
+}
+
+# Legend of the main Fig. 2e
+fig2e_style <- list(
+    scale_color_manual(breaks = c("Baseline", "Adjusted"), values = c("Baseline" = "#D55E00", "Adjusted" = "#009E73"),
+                       labels = c("Baseline\n(Officially reported OHI country scores for the year of 2022)",
+                                  "Adjusted\n(Recalculated OHI country scores for the year of 2022 with\naggregation for both weighting and substitutability\ncalibrated to median sample preferences)")),
+    theme(legend.position.inside = c(0.28, 0.6),
+          legend.spacing.y = unit(-5, "mm"),
+          legend.key.height = unit(2, "lines"))
+)
+
+## Figure layouts
+# Fig. 2 and its CI versions (SI Appendix Figs. S9, S10)
+arrange_fig2 <- function(panel_a, panel_b, panel_c, panel_d, panel_e) {
+    ggdraw() +
+        draw_plot(panel_a, x = 0, y = 0.69, width = 0.5, height = 0.3, scale = 1) +
+        draw_plot(panel_b, x = 0.52, y = 0.72, width = 0.48, height = 0.27, scale = 1) +
+        draw_plot(panel_c, x = 0.02, y = 0.42, width = 0.48, height = 0.28, scale = 1) +
+        draw_plot(panel_d, x = 0.52, y = 0.43, width = 0.48, height = 0.27, scale = 1) +
+        draw_plot(panel_e, x = 0.03, y = 0, width = 0.9, height = 0.41, scale = 1) +
+        draw_plot_label(c("a", "b", "c", "d", "e"), x = c(0, 0.5, 0, 0.5, 0), y = c(1, 1, 0.73, 0.73, 0.44), size = 10)
+}
+
+# Four stacked density panels (SI Appendix Figs. S4, S8)
+stack_four_panels <- function(panel_a, panel_b, panel_c, panel_d) {
+    ggdraw() +
+        draw_plot(panel_a, x = 0.03, y = 0.75, width = 0.95, height = 0.24, scale = 1) +
+        draw_plot(panel_b, x = 0.03, y = 0.50, width = 0.95, height = 0.24, scale = 1) +
+        draw_plot(panel_c, x = 0.03, y = 0.25, width = 0.95, height = 0.24, scale = 1) +
+        draw_plot(panel_d, x = 0.03, y = 0.00, width = 0.95, height = 0.24, scale = 1) +
+        draw_plot_label(c("a", "b", "c", "d"), x = c(0, 0, 0, 0), y = c(1, 0.76, 0.51, 0.26), size = 10)
+}
+```
+
+# Figure 2: Index aggregation preferences and reweighting of OHI scores
+
+## Panel a: Goal weights
+
+```{r fig2-panel-a}
+# Goals ordered by weight, with the number of decision blocks per goal
+panel_fig2_a_data <- alpha_total_sample %>%
+    arrange(desc(alpha_median)) %>%
+    mutate(n = sapply(goal, function(g) sum(str_detect(na.omit(ohi_estimates_online_eng$task_name), g))),
+           goal = factor(goal, levels = goal))
+
+panel_fig2_a <- plot_goal_weights(panel_fig2_a_data)
+```
+
+## Panel b: Weighting-adjusted scores
+
+```{r fig2-panel-b}
+set.seed(123) # jitter() in panels b and d
+
+# All countries get the overall weights, with the OHI's arithmetic aggregation (eta = 0)
+panel_fig2_b_data_long <- jitter_scores_long(country_scores %>% mutate(adjusted_OHI = adjusted_OHI_alphaonly))
+panel_fig2_b <- plot_score_shift(panel_fig2_b_data_long, "Weighting-adjusted", "#88316F", label_y = 70)
+
+# For text: paired t-test
+t.test(country_scores$base_OHI, country_scores$adjusted_OHI_alphaonly, paired = TRUE)
+```
+
+## Panel c: Distribution of eta
+
+```{r fig2-panel-c}
+panel_fig2_c <- ohi_estimates_online %>%
+    mutate(eta = pmin(eta, 5)) %>% # Cut off at 5
+    ggplot(aes(x = eta)) +
+    stat_ecdf(geom = "step", pad = FALSE, linewidth = 0.5, colour = "#08519c") +
+    # Benchmark means and the median estimate
+    geom_vline(xintercept = 0, linetype = "dashed", color = "#D55E00", linewidth = 0.3) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.3) +
+    geom_vline(xintercept = 2, linetype = "dashed", color = "gray40", linewidth = 0.3) +
+    geom_vline(xintercept = eta_total_sample, linetype = "solid", color = "#08519c", linewidth = 0.3) +
+    annotate("text", x = -0.05, y = 1.00, label = "Arithmetic Mean (OHI Status Quo)", angle = -90, vjust = -1, hjust = 0, size = 6 /.pt, color = "#D55E00") +
+    annotate("text", x = 0.95, y = 1.00, label = "Geometric Mean", angle = -90, vjust = -1, hjust = 0, size = 6 /.pt, color = "gray40") +
+    annotate("text", x = 1.95, y = 1.00, label = "Harmonic Mean", angle = -90, vjust = -1, hjust = 0, size = 6 /.pt, color = "gray40") +
+    annotate("text", x = eta_total_sample - 0.05, y = 1.00, label = "Median Estimate", angle = -90, vjust = -1, hjust = 0, size = 6 /.pt, color = "#08519c") +
+    annotate("text", x = eta_total_sample + 0.18, y = 0.47, label = sprintf("%.2f", eta_total_sample),
+             angle = -90, hjust = 0, vjust = 1, size = 6 /.pt, color = "#08519c") +
+    labs(x = TeX("Substitutability estimates ($ eta_{ng} $)"), y = "Cumulative distribution") +
+    scale_x_continuous(expand = expansion(0.05, 0), breaks = seq(0, 5, 1)) +
+    scale_y_continuous(expand = expansion(0, 0)) +
+    geom_segment(aes(x = 0, xend = 5, y = 0, yend = 0), inherit.aes = FALSE, linewidth = 0.4, color = "black") +
+    theme(panel.background = element_blank(),
+          axis.line = element_line(color = "black", linewidth = 0.3),
+          axis.line.y = element_line(colour = "black", linewidth = 0.3),
+          axis.line.x = element_blank(),
+          axis.ticks.x = element_line(color = "black", linewidth = 0.3),
+          axis.ticks.y = element_line(color = "black", linewidth = 0.3),
+          axis.ticks.length = unit(0.1, "cm"),
+          axis.text = element_text(size = 7),
+          axis.title = element_text(size = 7))
+
+# For text: sign test of H0: median eta = 0, one observation per participant (eta_n)
+eta_participant_level <- to_participant_level(ohi_estimates_online)
+print(SIGN.test(eta_participant_level$eta, md = 0))
+
+# For text: percentage of eta estimates between 0 and 0.2, and in the complements domain (eta > 1)
+mean(ohi_estimates_online$eta >= 0 & ohi_estimates_online$eta <= 0.2) * 100
+mean(ohi_estimates_online$eta > 1) * 100
+```
+
+## Panel d: Substitutability-adjusted scores
+
+```{r fig2-panel-d}
+# All countries get the overall median eta, with the OHI's equal weights (alpha = 1/N)
+panel_fig2_d_data_long <- jitter_scores_long(country_scores %>% mutate(adjusted_OHI = adjusted_OHI_etaonly))
+panel_fig2_d <- plot_score_shift(panel_fig2_d_data_long, "Substitutability-adjusted", "#08519c", label_y = 60)
+
+# For text: paired t-test
+t.test(country_scores$base_OHI, country_scores$adjusted_OHI_etaonly, paired = TRUE)
+
+# For text: mean change in OHI scores (%) with the geometric (eta = 1) and harmonic (eta = 2) mean, equal weights
+OHI_table %>%
+    group_by(country) %>%
+    summarise(base_OHI = base_OHI[1],
+              geometric = calculate_OHI_score(rep(0.1, 10), goal_score, 1),
+              harmonic = calculate_OHI_score(rep(0.1, 10), goal_score, 2)) %>%
+    summarise(across(c(geometric, harmonic), ~ (mean(.x) - mean(base_OHI)) / mean(base_OHI) * 100))
+```
+
+## Panel e: Weighting- and substitutability-adjusted scores
+
+```{r fig2-panel-e}
+# All countries get the overall weights and median eta
+panel_fig2_e_data <- country_scores %>% mutate(adjusted_OHI = adjusted_OHI_global)
+panel_fig2_e <- plot_ohi_density_panel(panel_fig2_e_data) + fig2e_style
+
+# For text: paired t-test of the means and Pitman-Morgan test of the variances
+t.test(panel_fig2_e_data$base_OHI, panel_fig2_e_data$adjusted_OHI, paired = TRUE)
+PairedData::Var.test(panel_fig2_e_data$base_OHI, panel_fig2_e_data$adjusted_OHI, paired = TRUE)
+sd(panel_fig2_e_data$base_OHI)
+sd(panel_fig2_e_data$adjusted_OHI)
+
+# For text: adjusted score of the average goal scores across countries
+global_ohi_decrease_data <- OHI_table %>%
+    group_by(goal) %>%
+    summarise(goal_score = mean(goal_score, na.rm = TRUE)) %>%
+    left_join(alpha_total_sample, by = "goal") %>%
+    summarise(base_OHI = mean(goal_score, na.rm = TRUE),
+              adjusted_OHI = calculate_OHI_score(alpha_median, goal_score, eta_total_sample))
+```
+
+## Save Figure 2
+
+```{r fig2-save}
+save_plot(filename = here("2_Graphs", "Figure_Panel2.pdf"),
+          plot = arrange_fig2(panel_fig2_a, panel_fig2_b, panel_fig2_c, panel_fig2_d, panel_fig2_e),
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 6.69) # 17.0cm in inch
+```
+
+## For text: Goal weights differ from equal weighting
+
+```{r fig2-equal-weighting-test}
+# Two-sided bootstrap-t tests of H0: alpha_i = 1/10 for every goal, with a nested participant bootstrap: B_outer
+# resamples, each with B_inner inner resamples for its standard error. No output depends on this test and it is slow,
+# so it is switched off by default; the reported results use the values below.
+run_alpha_bootstrap <- FALSE
+B_outer <- 1000
+B_inner <- 200
+
+if (run_alpha_bootstrap) {
+    library(foreach)
+    library(doParallel)
+    library(doRNG)
+    rng_state <- .Random.seed # doRNG changes the RNG kind: restored at the end
+
+    cluster <- parallel::makeCluster(parallel::detectCores())
+    registerDoParallel(cluster)
+    registerDoRNG(123)
+    parallel::clusterExport(cluster, c("retrieve_alphas", "resample_participants", "ohi_estimates_online",
+                                       "goals", "german_to_english", "B_inner"), envir = environment())
+    worker_packages <- c("dplyr", "tidyr", "tibble", "stringr", "purrr")
+
+    # Standard errors of the weights on the original sample
+    inner_draws <- foreach(s = seq_len(B_inner), .combine = bind_rows, .packages = worker_packages) %dorng% {
+        retrieve_alphas(resample_participants(ohi_estimates_online))
+    }
+    se_hat <- inner_draws %>%
+        group_by(goal) %>%
+        summarize(se_hat = sd(alpha_median), .groups = "drop")
+
+    # Outer resamples: weights and their standard errors from the nested resamples
+    outer_draws <- foreach(b = seq_len(B_outer), .combine = bind_rows, .packages = worker_packages) %dorng% {
+        outer_sample <- resample_participants(ohi_estimates_online)
+        nested_draws <- purrr::map_dfr(seq_len(B_inner), function(s) retrieve_alphas(resample_participants(outer_sample)))
+        retrieve_alphas(outer_sample) %>%
+            rename(theta_star = alpha_median) %>%
+            left_join(nested_draws %>% group_by(goal) %>% summarize(se_star = sd(alpha_median), .groups = "drop"), by = "goal")
+    }
+
+    parallel::stopCluster(cluster)
+    assign(".Random.seed", rng_state, envir = globalenv())
+
+    # p-values and bootstrap-t confidence intervals per goal
+    alpha_ttest_results <- tibble()
+    for (goal_tested in goals) {
+        theta_hat <- alpha_total_sample$alpha_median[alpha_total_sample$goal == goal_tested]
+        se_theta_hat <- se_hat$se_hat[se_hat$goal == goal_tested]
+        stopifnot(is.finite(se_theta_hat), se_theta_hat > 0)
+
+        goal_draws <- filter(outer_draws, goal == goal_tested)
+        valid <- is.finite(goal_draws$theta_star) & is.finite(goal_draws$se_star) & goal_draws$se_star > 0 # Drop degenerate SEs
+        theta_star <- goal_draws$theta_star[valid]
+        t_star <- (theta_star - theta_hat) / goal_draws$se_star[valid]
+        t_obs <- (theta_hat - 0.1) / se_theta_hat
+        n_valid <- length(t_star)
+        stopifnot(n_valid > 0)
+        p_value <- min(1, 2 * min((1 + sum(t_star <= t_obs)) / (1 + n_valid), (1 + sum(t_star >= t_obs)) / (1 + n_valid)))
+        t_quantiles <- unname(quantile(t_star, probs = c(0.025, 0.975)))
+
+        alpha_ttest_results <- bind_rows(alpha_ttest_results, tibble(
+            goal = goal_tested,
+            mean_alpha = mean(theta_star),
+            median_alpha = median(theta_star),
+            t_obs = t_obs,
+            t_crit_low = t_quantiles[1],
+            t_crit_high = t_quantiles[2],
+            p_value = p_value,
+            conf_low = theta_hat - t_quantiles[2] * se_theta_hat,
+            conf_high = theta_hat - t_quantiles[1] * se_theta_hat))
+    }
+    print(alpha_ttest_results)
+}
+```
+
+# Figure 3: Drivers of change
+
+## Panel a: Decomposition of the score change
+
+```{r fig3-panel-a}
+# Mean total change and its decomposition into weighting, substitutability and interaction effects
+fig3a_effects <- OHI_table %>%
+    mutate(total = adjusted_OHI_global - base_OHI,
+           weighting = adjusted_OHI_alphaonly - base_OHI,
+           substitutability = adjusted_OHI_etaonly - base_OHI,
+           interaction = total - weighting - substitutability) %>%
+    summarise(across(c(total, weighting, substitutability, interaction), mean))
+
+effect_labels <- c("Total\nchange", "Weighting\neffect", "Substitutability\neffect", "Interaction\neffect")
+panel_fig3_a_data <- tibble(
+    Effect = factor(effect_labels, levels = effect_labels),
+    Value = c(fig3a_effects$total, fig3a_effects$weighting, fig3a_effects$substitutability, fig3a_effects$interaction)
+)
+
+panel_fig3_a <- ggplot(panel_fig3_a_data, aes(x = Effect, y = Value, fill = Effect)) +
+    geom_bar(stat = "identity", width = 0.7, alpha = 0.8) +
+    geom_text(aes(label = ifelse(Value >= 0, paste0("+", round(Value, 2)), round(Value, 2)), vjust = ifelse(Value >= 0, -0.5, 1.5)), size = 7 /.pt) +
+    geom_vline(xintercept = 1.5, linetype = "dotted", color = "black", linewidth = 0.2) +
+    geom_hline(yintercept = 0, linetype = "solid", color = "black", linewidth = 0.2) +
+    labs(y = "Mean change in OHI scores") +
+    scale_fill_manual(values = c("#009E73", "#88316F", "#08519c", "#999999")) +
+    scale_y_continuous(limits = c(-20, 5), expand = c(0, 0)) +
+    theme_basic +
+    theme_axes +
+    theme(legend.position = "none",
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 7),
+          axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 1, size = 7, margin = margin(r = 2)))
+```
+
+## For text: Weights and goal scores
+
+```{r fig3-alpha-score-regression}
+# Block-level weight on goal 1 with the 2022 scores of both goals in the participant's country
+goal_scores_2022 <- OHI_table %>% select(country_code, goal, goal_score)
+alpha_score_regression_data <- estimates_wcountry %>%
+    mutate(task_name = str_replace_all(task_name, pattern = german_to_english)) %>%
+    separate_wider_delim(task_name, delim = "-", names = c("goal1", "goal2")) %>%
+    rename(country_code = country_abrv) %>%
+    left_join(goal_scores_2022 %>% rename(goal1 = goal, goal1_score = goal_score), by = c("country_code", "goal1")) %>%
+    left_join(goal_scores_2022 %>% rename(goal2 = goal, goal2_score = goal_score), by = c("country_code", "goal2"))
+
+# OLS with standard errors clustered by country (each participant rates one country)
+stopifnot(all(tapply(alpha_score_regression_data$country_code, alpha_score_regression_data$participant_code, n_distinct) == 1))
+alpha_score_model <- lm(alpha ~ goal1_score, data = alpha_score_regression_data)
+print(cluster_robust_coefs(alpha_score_model, alpha_score_regression_data$country_code))
+```
+
+## Panel b: Score change and goal-score inequality
+
+```{r fig3-panel-b}
+# All countries get the overall preferences
+panel_fig3_b_data <- country_scores %>%
+    transmute(country, gini, rel_change = adjusted_OHI_global / base_OHI)
+
+panel_fig3_b <- ggplot(panel_fig3_b_data, aes(x = gini, y = rel_change)) +
+    geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = TRUE, color = "#56B4E9", size = 0.3) +
+    geom_point(data = panel_fig3_b_data, size = 1, color = "black") +
+    scale_y_continuous(expand = expansion(0, 0)) +
+    scale_x_continuous(expand = expansion(0, 0)) +
+    coord_cartesian(xlim = c(0, 0.4), ylim = c(0, 1)) +
+    labs(x = "Gini coefficient of goal scores", y = TeX("Relative adjusted OHI score"), color = NULL) +
+    theme_basic +
+    theme_axes +
+    theme(axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 0, size = 7, margin = margin(r = 2)),
+          axis.title.x = element_text(vjust = 5, size = 7),
+          axis.title.y = element_text(size = 6),
+          legend.position = "none")
+```
+
+## Panel c: Lowest-scoring goals
+
+```{r fig3-panel-c}
+# Number of countries in which each goal has the lowest score
+panel_fig3_c_data <- OHI_table %>%
+    group_by(country) %>%
+    filter(goal_score == min(goal_score)) %>%
+    ungroup() %>%
+    count(goal) %>%
+    complete(goal = sort(goals), fill = list(n = 0)) %>%
+    mutate(goal = factor(goal, levels = sort(goals)))
+
+panel_fig3_c <- ggplot(panel_fig3_c_data, aes(x = goal, y = n, fill = goal)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = goal_colors) +
+    labs(x = "Goal", y = "Frequency of lowest goal scores") +
+    scale_y_continuous(limits = c(0, 70), expand = c(0, 0)) +
+    theme_basic +
+    theme_axes +
+    theme(legend.position = "none",
+          axis.text.x = element_text(vjust = 7, size = 7),
+          axis.text.y = element_text(hjust = 1, size = 7, margin = margin(r = 2)),
+          axis.ticks.x = element_blank(),
+          axis.title.y = element_text(size = 7),
+          axis.title.x = element_text(size = 7, vjust = 3))
+```
+
+## Panel d: Goal-score inequality and GDP per capita
+
+```{r fig3-panel-d}
+un_gdp_data <- list.files(path = here("1_Data", "1_raw", "UN GDP Data"), pattern = "^UNdata_Export_.*\\.csv$", full.names = TRUE) %>%
+    read_csv() %>%
+    distinct() %>% # Drop rows that appear in several exports
+    filter(Year == 2023) %>%
+    mutate(`Country or Area` = ifelse(`Country or Area` == "China (mainland)", "China", `Country or Area`))
+stopifnot(!anyDuplicated(un_gdp_data$`Country or Area`)) # One GDP value per country
+
+panel_fig3_d_data <- country_scores %>%
+    select(country, gini) %>%
+    mutate(country = case_when( # Country names of the UN GDP data
+            country == "Brunei" ~ "Brunei Darussalam",
+            country == "Cape Verde" ~ "Cabo Verde",
+            country == "Comoro Islands" ~ "Comoros",
+            country == "Ivory Coast" ~ "Côte d'Ivoire",
+            country == "Iran" ~ "Iran, Islamic Republic of",
+            country == "North Korea" ~ "Democratic People's Republic of Korea",
+            country == "Curacao" ~ "Curaçao",
+            country == "East Timor" ~ "Timor-Leste",
+            country == "Gilbert Islands (Kiribati)" ~ "Kiribati",
+            country == "Guinea Bissau" ~ "Guinea-Bissau",
+            country == "Micronesia" ~ "Micronesia (Federated States of)",
+            country == "Puerto Rico and Virgin Islands of the United States" ~ "Puerto Rico",
+            country == "Republique du Congo" ~ "Congo",
+            country == "Russia" ~ "Russian Federation",
+            country == "South Korea" ~ "Republic of Korea",
+            country == "Syria" ~ "Syrian Arab Republic",
+            country == "Tanzania" ~ "United Republic of Tanzania: Mainland",
+            country == "Turkey" ~ "Türkiye",
+            country == "United Kingdom" ~ "United Kingdom of Great Britain and Northern Ireland",
+            country == "Venezuela" ~ "Venezuela (Bolivarian Republic of)",
+            country == "Vietnam" ~ "Viet Nam",
+            .default = country)) %>%
+    left_join(un_gdp_data %>% select(country = `Country or Area`, gdp_per_capita = Value), by = "country") %>%
+    filter(!is.na(gdp_per_capita)) %>% # Drop countries without GDP data
+    mutate(gdp_per_capita = round(gdp_per_capita))
+
+# For text: OLS of the Gini coefficient on GDP per capita (in 10,000 USD)
+model_3d <- lm(gini ~ I(gdp_per_capita / 10000), data = panel_fig3_d_data)
+print(summary(model_3d))
+
+panel_fig3_d <- ggplot(panel_fig3_d_data, aes(x = gdp_per_capita, y = gini)) +
+    geom_smooth(method = "lm", color = "#56B4E9", size = 0.3, se = TRUE) +
+    geom_point(size = 1, color = "black") +
+    labs(x = "GDP per capita in 2023 (USD)", y = TeX("Gini coefficient of goal scores")) +
+    scale_x_continuous(labels = scales::comma, expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, 130000), ylim = c(0, 0.4)) +
+    theme_basic +
+    theme_axes +
+    theme(axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 0, size = 7, margin = margin(r = 2)),
+          axis.title.x = element_text(vjust = 5, size = 7),
+          axis.title.y = element_text(size = 7),
+          legend.position = "none")
+```
+
+## Save Figure 3
+
+```{r fig3-save}
+panel_fig3 <- ggdraw() +
+   draw_plot(panel_fig3_a, x = 0, y = 0.5, width = 0.5, height = 0.5, scale = 1) +
+   draw_plot(panel_fig3_b, x = 0.5, y = 0.5, width = 0.5, height = 0.5, scale = 1) +
+   draw_plot(panel_fig3_c, x = 0, y = 0, width = 0.5, height = 0.5, scale = 1) +
+   draw_plot(panel_fig3_d, x = 0.5, y = 0, width = 0.5, height = 0.5, scale = 1) +
+   draw_plot_label(c("a", "b", "c", "d"), x = c(0, 0.5, 0, 0.5), y = c(1, 1, 0.5, 0.5), size = 10)
+
+save_plot(filename = here("2_Graphs", "Figure_Panel3.pdf"),
+          plot = panel_fig3,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 5)
+```
+
+# Figure 4: Heterogeneity in scores and preferences
+
+## Panel a: Sample countries under country vs. global preferences
+
+```{r fig4-panel-a}
+panel_fig4_a_data <- OHI_table %>%
+    filter(country %in% sample_countries) %>%
+    mutate(change = adjusted_OHI - base_OHI,
+           change_global = adjusted_OHI_global - base_OHI) %>%
+    arrange(change)
+
+panel_fig4_a <- ggplot(panel_fig4_a_data, aes(x = reorder(country, base_OHI, decreasing = TRUE))) +
+    # Grey lines connecting the three scores
+    geom_segment(aes(x = country, xend = country, y = base_OHI, yend = adjusted_OHI), color = "grey", linewidth = 0.1) +
+    geom_segment(aes(x = country, xend = country, y = adjusted_OHI, yend = adjusted_OHI_global), color = "grey", linewidth = 0.1) +
+    geom_point(aes(y = base_OHI, color = "Baseline"), size = 1) +
+    geom_point(aes(y = adjusted_OHI, color = "Adjusted (country preferences)"), size = 1) +
+    geom_point(aes(y = adjusted_OHI_global, color = "Adjusted (global preferences)"), size = 1) +
+    geom_text(aes(y = base_OHI, label = round(base_OHI, 0)), nudge_x = 0.4, check_overlap = TRUE, size = 7 /.pt) +
+    geom_text(aes(y = adjusted_OHI, label = round(adjusted_OHI, 0)), nudge_x = 0.4, check_overlap = TRUE, size = 7 /.pt) +
+    geom_text(aes(y = adjusted_OHI_global, label = round(adjusted_OHI_global, 0)), nudge_x = ifelse(abs(panel_fig4_a_data$change - panel_fig4_a_data$change_global) > 2, 0.4, -0.35), check_overlap = TRUE, size = 7 /.pt) +
+    scale_color_manual(
+        breaks = c("Baseline", "Adjusted (country preferences)", "Adjusted (global preferences)"),
+        values = c("Baseline" = "#D55E00", "Adjusted (country preferences)" = "black", "Adjusted (global preferences)" = "#009E73")
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 1))) +
+    labs(x = "Country", y = "OHI score") +
+    scale_y_continuous(limits = c(35, 80), expand = c(0, 0), breaks = seq(35, 80, 5)) +
+    theme_basic +
+    theme_axes +
+    theme(legend.position = "inside",
+          legend.position.inside = c(0.3, 0.13),
+          legend.background = element_blank(),
+          legend.key.spacing.y = unit(-0.55, "lines"),
+          legend.key.width = unit(-1, "lines"),
+          legend.title = element_blank(),
+          legend.text = element_text(size = 7),
+          axis.title = element_text(size = 7),
+          axis.text = element_text(size = 7),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.3),
+          axis.text.y = element_text(hjust = 1, size = 7, margin = margin(r = 2)),
+          plot.margin = unit(c(0.2, 0, 0, 0), "cm"),
+          axis.title.x = element_blank())
+```
+
+## Panel b: OHI scores over time
+
+```{r fig4-panel-b}
+# Balanced panel: countries with all goal and index scores in every year 2012-2022 (drops Djibouti and Sudan, whose
+# NP scores are missing until 2016/2017, and Australia and Japan, which lack TR scores in all years)
+timeseries_countries <- ohi_scores %>%
+    filter(scenario %in% 2012:2022,
+           goal %in% c(goals, "Index"),
+           dimension == "score",
+           !is.na(value)) %>%
+    count(region_name) %>%
+    filter(n == length(2012:2022) * (length(goals) + 1)) %>%
+    pull(region_name)
+
+# Baseline and adjusted index (overall preferences) per country and year
+index_timeseries <- ohi_scores %>%
+    filter(goal == "Index", dimension == "score") %>%
+    select(year = scenario, country = region_name, base_OHI = value)
+
+OHI_table_allyears <- ohi_scores %>%
+    filter(scenario %in% 2012:2022, goal %in% goals, dimension == "score", region_name %in% timeseries_countries) %>%
+    arrange(goal) %>%
+    mutate(alpha_global = alpha_total_sample$alpha_median[match(goal, alpha_total_sample$goal)]) %>%
+    select(year = scenario, country = region_name, goal, goal_score = value, alpha_global) %>%
+    group_by(year, country) %>%
+    summarise(adjusted_OHI_global = calculate_OHI_score(alpha_global, goal_score, eta_total_sample), .groups = "drop") %>%
+    left_join(index_timeseries, by = c("year", "country"))
+
+# Mean across countries per year
+OHI_table_allyears <- OHI_table_allyears %>%
+    bind_rows(OHI_table_allyears %>%
+                  group_by(year) %>%
+                  summarise(country = "Global average", base_OHI = mean(base_OHI), adjusted_OHI_global = mean(adjusted_OHI_global)))
+
+panel_fig4_b_data <- OHI_table_allyears %>%
+    filter(country %in% c("Global average", "Singapore", "Honduras"))
+
+panel_fig4_b <- ggplot(panel_fig4_b_data, aes(x = year, group = country)) +
+    geom_line(aes(y = base_OHI, color = country, linetype = "Base"), size = 0.2) +
+    geom_line(aes(y = adjusted_OHI_global, color = country, linetype = "Adjusted"), size = 0.4) +
+    scale_color_manual(values = c("Global average" = "Grey", "Singapore" = "#08519c", "Honduras" = "#F5C710")) +
+    scale_linetype_manual(values = c("Base" = "dashed", "Adjusted" = "solid"), labels = c("Adjusted", "Baseline")) +
+    scale_x_continuous(breaks = unique(panel_fig4_b_data$year), labels = as.character(unique(panel_fig4_b_data$year))) +
+    scale_y_continuous(breaks = seq(35, 80, 5)) +
+    coord_cartesian(ylim = c(35, 80)) +
+    labs(x = "Year", y = "OHI score", color = NULL, linetype = NULL) +
+    theme_basic +
+    theme_axes +
+    theme(legend.position = "inside",
+          legend.position.inside = c(0.2, 0.17),
+          legend.background = element_blank(),
+          legend.title = element_blank(),
+          legend.text = element_text(size = 7),
+          legend.spacing.x = unit(0, "mm"),
+          legend.spacing.y = unit(-2, "mm"),
+          legend.key.height = unit(0.6, "lines"),
+          legend.key.spacing.y = unit(0, "lines"),
+          plot.margin = unit(c(0, 0, 0, 0), "cm"),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 7),
+          axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 0, size = 7, margin = margin(r = 2)))
+
+# For text: percentage change of the mean score from 2012 to 2022, baseline and adjusted
+ohi_global_2012 <- OHI_table_allyears %>% filter(country == "Global average", year == 2012)
+ohi_global_2022 <- OHI_table_allyears %>% filter(country == "Global average", year == 2022)
+(ohi_global_2022$base_OHI - ohi_global_2012$base_OHI) / ohi_global_2012$base_OHI * 100
+(ohi_global_2022$adjusted_OHI_global - ohi_global_2012$adjusted_OHI_global) / ohi_global_2012$adjusted_OHI_global * 100
+```
+
+## For text: Substitutability in OECD vs. non-OECD countries
+
+```{r fig4-oecd-test}
+# Rank-sum test with one observation per country (the country median of eta_ng)
+oecd_countries <- c("AU", "CA", "FR", "DE", "JP", "US")
+estimates_oecdtype_country_level <- estimates_wcountry %>%
+    mutate(country_type = ifelse(country_abrv %in% oecd_countries, "OECD", "Non-OECD")) %>%
+    group_by(country_abrv, country_type) %>%
+    summarise(eta = median(eta), .groups = "drop")
+print(estimates_oecdtype_country_level %>%
+    group_by(country_type) %>%
+    summarise(median_eta = median(eta), n_countries = n()))
+print(wilcox.test(eta ~ country_type, data = estimates_oecdtype_country_level, alternative = "two.sided", conf.int = TRUE))
+```
+
+## Panel c: Substitutability and GDP per capita
+
+```{r fig4-panel-c}
+panel_fig4_c_data <- eta_per_country %>%
+    rename(country_code = country_abrv) %>%
+    mutate(country = country_codes$region_name[match(country_code, country_codes$country_abrv)]) %>%
+    left_join(un_gdp_data %>% select(country = `Country or Area`, gdp_per_capita = Value), by = "country") %>%
+    mutate(gdp_per_capita = round(gdp_per_capita))
+
+# For text: Pearson correlation of the country medians of eta_ng with GDP per capita
+cor.test(panel_fig4_c_data$eta_median, panel_fig4_c_data$gdp_per_capita, method = "pearson")
+
+panel_fig4_c <- ggplot(panel_fig4_c_data, aes(x = gdp_per_capita, y = eta_median)) +
+    geom_point(size = 1, color = "black") +
+    geom_text_repel(aes(label = country_code), size = 7 /.pt, color = "black", max.overlaps = Inf, box.padding = 0.1, point.padding = 0.0, seed = 1) +
+    geom_smooth(method = "lm", color = "#56B4E9", size = 0.3, se = FALSE) +
+    labs(x = "GDP per capita in 2023 (USD)", y = TeX("Median substitutability estimate ($\\eta_{ng})")) +
+    scale_x_continuous(limits = c(0, 90000), labels = scales::comma, expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 6), expand = c(0, 0)) +
+    theme_basic +
+    theme_axes +
+    theme(axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 0, size = 7, margin = margin(r = 2)),
+          axis.title.x = element_text(vjust = 4, size = 7),
+          axis.title.y = element_text(size = 7),
+          legend.position = "none")
+```
+
+## Panel d: Demographics and substitutability
+
+```{r fig4-panel-d}
+# Median regression of log(eta_n) with country fixed effects, one observation per participant
+panel_fig4_d_data <- ohi_estimates_online %>%
+    to_participant_level() %>%
+    add_survey_data()
+
+panel_fig4_d_regeta <- rq(log(eta) ~ age + gender + days_at_sea + ocean_health_importance + session_label,
+                          tau = 0.5, panel_fig4_d_data)
+print(summary(panel_fig4_d_regeta)) # For text
+
+demographics_labels <- c(
+    "(Intercept)" = "Constant",
+    "age" = "Age\n(in years)",
+    "genderfemale" = "Female",
+    "days_at_sea" = "Days at coast\n(per year)",
+    "ocean_health_importance" = "Cares about\nocean health"
+)
+demographics_terms <- c("ocean_health_importance", "days_at_sea", "genderfemale", "age")
+
+panel_fig4_d_coef <- broom::tidy(panel_fig4_d_regeta, conf.int = TRUE) %>%
+    filter(term %in% demographics_terms) %>%
+    mutate(term = factor(term, levels = demographics_terms))
+
+panel_fig4_d <- ggplot(panel_fig4_d_coef, aes(y = term, x = estimate, xmin = conf.low, xmax = conf.high)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey", linewidth = 0.2) +
+    geom_pointrange(size = 0.01, color = "#56B4E9", linewidth = 0.2) +
+    geom_text(aes(label = round(estimate, 3)), hjust = 0.5, vjust = -0.8, size = 7 /.pt) +
+    geom_text(aes(label = paste0("CI: [", round(conf.low, 3), "; ", round(conf.high, 3), "]")), x = -0.37, hjust = 0, size = 7 /.pt, color = "black") +
+    scale_y_discrete(labels = demographics_labels) +
+    labs(y = NULL, x = TeX("log($\\eta_{n}$)")) +
+    scale_x_continuous(limits = c(-0.4, 0.4), expand = c(0, 0)) +
+    theme_basic +
+    theme_axes +
+    theme(axis.text.y = element_text(angle = 0, hjust = 1, vjust = 0.5, size = 7, margin = margin(r = 2)),
+          axis.text.x = element_text(vjust = 6, size = 7),
+          axis.title.y = element_blank(),
+          axis.title.x = element_text(vjust = 4, size = 7),
+          legend.position = "none",
+          plot.margin = unit(c(0, 0, 0, 0), "cm"))
+```
+
+## Save Figure 4
+
+```{r fig4-save}
+panel_fig4 <- ggdraw() +
+   draw_plot(panel_fig4_a, x = 0.03, y = 0.45, width = 0.47, height = 0.53, scale = 1) +
+   draw_plot(panel_fig4_b, x = 0.52, y = 0.5, width = 0.45, height = 0.46, scale = 1) +
+   draw_plot(panel_fig4_c, x = 0.01, y = 0, width = 0.5, height = 0.45, scale = 1) +
+   draw_plot(panel_fig4_d, x = 0.50, y = 0.02, width = 0.45, height = 0.4, scale = 1) +
+   draw_plot_label(c("a", "b", "c", "d"), x = c(0, 0.5, 0, 0.5), y = c(1, 1, 0.5, 0.5), size = 10)
+
+save_plot(filename = here("2_Graphs", "Figure_Panel4.pdf"),
+          plot = panel_fig4,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 5.2)
+```
+
+# SI Appendix Fig. S8: Fig. 2e for alternative samples
+
+```{r fig-s8}
+# Fully rational participants only (no excluded decision block, see 05_Sample_Selection.qmd)
+fully_rational_sample_selection <- read_csv(here("1_Data", "2_processed", "main_sample_selection_fullyrational.csv"))
+fully_rational_prep <- compute_prep(fully_rational_sample_selection)
+# Main sample with synthetic balancing to three decision blocks per participant
+synthetic_fill_prep <- compute_prep(main_sample_subject_selection, synthetic_fill = TRUE)
+# Corner solutions re-included as perfect substitutes (eta = 0) or near-Leontief (eta = 100)
+unipref_sample_selection <- read_csv(here("1_Data", "2_processed", "main_sample_selection_unipref.csv"))
+unipref_eta0_prep <- compute_prep(unipref_sample_selection, unipref_eta = 0)
+unipref_eta100_prep <- compute_prep(unipref_sample_selection, unipref_eta = 100)
+
+# Fig. 2e panel of a sample: all countries get the overall preferences of that sample
+plot_fig2e_of_sample <- function(prep, panel_title) {
+    prep$OHI_table %>%
+        distinct(country, .keep_all = TRUE) %>%
+        mutate(adjusted_OHI = adjusted_OHI_global) %>%
+        plot_ohi_density_panel(panel_title)
+}
+
+extdata_fig2e_sensitivity <- stack_four_panels(
+    plot_fig2e_of_sample(fully_rational_prep, "Fully rational participants only (no excluded decision blocks)"),
+    plot_fig2e_of_sample(synthetic_fill_prep, "Synthetic balancing to three decision blocks per participant"),
+    plot_fig2e_of_sample(unipref_eta0_prep, "Corner solutions re-included, perfect substitutes (eta = 0)"),
+    plot_fig2e_of_sample(unipref_eta100_prep, "Corner solutions re-included, near-Leontief (eta = 100)"))
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS8.pdf"),
+          plot = extdata_fig2e_sensitivity,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 6.69) # 17.0cm in inch
+```
+
+# SI Appendix Fig. S9: Fig. 2 with Krinsky-Robb confidence intervals
+
+```{r fig-s9-functions}
+# Estimation uncertainty: for every decision block, draw (alpha, eta) from the sampling distribution of the Tobit
+# estimates, N(estimate, inverse observed information), and rerun the Fig. 2 aggregation for each draw
+
+## Tobit negative log-likelihood (transcription of 4_Code/Matlab_OHI/C_lolik.m)
+nll <- function(par, shares, prices) { # par = c(alpha, eta, log(sigma))
+    alpha <- par[1]
+    eta <- par[2]
+    sigm <- max(exp(par[3]), 1e-5)
+    mu <- 1 / (1 + exp(((eta - 1) * log(prices) + log((1 - alpha) / alpha)) / eta))
+    at_zero <- shares == 0
+    at_one <- shares == 1
+    interior <- !at_zero & !at_one
+    ll <- numeric(length(shares))
+    if (any(at_zero)) ll[at_zero] <- log(pnorm(-mu[at_zero] / sigm))
+    if (any(at_one)) ll[at_one] <- log(pmax(1e-8, pnorm((1 - mu[at_one]) / sigm, lower.tail = FALSE)))
+    if (any(interior)) ll[interior] <- -0.5 * (log(2 * pi) + log(sigm^2) + ((shares[interior] - mu[interior]) / sigm)^2)
+    -sum(ll)
+}
+
+## Central-difference gradient and Hessian
+fd_grad <- function(f, x) {
+    step <- 1e-4 * pmax(abs(x), 1)
+    g <- numeric(length(x))
+    for (i in seq_along(x)) {
+        x_plus <- x_minus <- x
+        x_plus[i] <- x[i] + step[i]
+        x_minus[i] <- x[i] - step[i]
+        g[i] <- (f(x_plus) - f(x_minus)) / (2 * step[i])
+    }
+    g
+}
+
+fd_hessian <- function(f, x) {
+    n <- length(x)
+    step <- 1e-4 * pmax(abs(x), 1)
+    H <- matrix(0, n, n)
+    f0 <- f(x)
+    for (i in seq_len(n)) {
+        x_plus <- x_minus <- x
+        x_plus[i] <- x[i] + step[i]
+        x_minus[i] <- x[i] - step[i]
+        H[i, i] <- (f(x_plus) - 2 * f0 + f(x_minus)) / step[i]^2
+        if (i < n) for (j in (i + 1):n) {
+            f_shifted <- function(si, sj) {
+                y <- x
+                y[i] <- x[i] + si * step[i]
+                y[j] <- x[j] + sj * step[j]
+                f(y)
+            }
+            H[i, j] <- H[j, i] <- (f_shifted(1, 1) - f_shifted(1, -1) - f_shifted(-1, 1) + f_shifted(-1, -1)) / (4 * step[i] * step[j])
+        }
+    }
+    H
+}
+
+## Fig. 2 quantities for a set of block estimates: %-changes of panels b, d, e, the weights (a) and median eta (c)
+compute_fig2_summary <- function(estimates) {
+    alpha_weights <- retrieve_alphas(estimates)
+    eta_draw <- median(estimates$eta)
+    scores <- OHI_table %>%
+        mutate(alpha_draw = alpha_weights$alpha_median[match(goal, alpha_weights$goal)]) %>%
+        group_by(country) %>%
+        mutate(adj_full  = calculate_OHI_score(alpha_draw, goal_score, eta_draw),
+               adj_alpha = calculate_OHI_score(alpha_draw, goal_score, 0),
+               adj_eta   = calculate_OHI_score(rep(0.1, 10), goal_score, eta_draw)) %>%
+        ungroup() %>%
+        distinct(country, .keep_all = TRUE)
+    base_mean <- mean(scores$base_OHI)
+    list(summary = c(pct_alpha  = (mean(scores$adj_alpha) - base_mean) / base_mean * 100,
+                     pct_eta    = (mean(scores$adj_eta)   - base_mean) / base_mean * 100,
+                     pct_change = (mean(scores$adj_full)  - base_mean) / base_mean * 100),
+         alpha = setNames(alpha_weights$alpha_median, alpha_weights$goal),
+         eta = eta_draw)
+}
+
+## Fig. 2 with confidence intervals (also used for SI Appendix Fig. S10)
+# ci: 2 x 3 matrix for panels b, d, e; alpha_ci: 2 x 10 matrix for panel a; eta_ci: CI of the median eta (panel c)
+build_fig2_ci_figure <- function(ci, alpha_ci, eta_ci, filename) {
+    ci_label <- function(panel) sprintf("[%+.1f, %+.1f]", ci[1, panel], ci[2, panel])
+    panel_c_ci <- panel_fig2_c +
+        annotate("text", x = eta_total_sample + 0.18, y = 0.47,
+                 label = sprintf("%.2f  [%.2f, %.2f]", eta_total_sample, eta_ci[1], eta_ci[2]),
+                 angle = -90, hjust = 0, vjust = 1, size = 6 / .pt, colour = "#08519c")
+    fig2_ci <- arrange_fig2(
+        plot_goal_weights(panel_fig2_a_data, alpha_ci),
+        plot_score_shift(panel_fig2_b_data_long, "Weighting-adjusted", "#88316F", label_y = 70, ci_label = ci_label("pct_alpha")),
+        panel_c_ci,
+        plot_score_shift(panel_fig2_d_data_long, "Substitutability-adjusted", "#08519c", label_y = 60, ci_label = ci_label("pct_eta")),
+        plot_ohi_density_panel(panel_fig2_e_data, ci_label = ci_label("pct_change")) + fig2e_style)
+    save_plot(filename = here("2_Graphs", filename), plot = fig2_ci, base_width = 7.2, base_height = 6.69)
+}
+
+## Point estimates of the Fig. 2 quantities
+panels <- c("pct_alpha", "pct_eta", "pct_change")
+base_mean <- mean(country_scores$base_OHI)
+pts <- c(pct_alpha  = (mean(country_scores$adjusted_OHI_alphaonly) - base_mean) / base_mean * 100,
+         pct_eta    = (mean(country_scores$adjusted_OHI_etaonly)   - base_mean) / base_mean * 100,
+         pct_change = (mean(country_scores$adjusted_OHI_global)    - base_mean) / base_mean * 100)
+alpha_pts <- setNames(alpha_total_sample$alpha_median, alpha_total_sample$goal)[goals]
+
+# Prints the point estimates with their CIs
+print_fig2_ci <- function(ci, alpha_ci, eta_ci) {
+    for (p in panels) cat(sprintf("  %-11s point %+6.2f%%  95%% CI [%+6.2f%%, %+6.2f%%]\n", p, pts[p], ci[1, p], ci[2, p]))
+    for (g in goals) cat(sprintf("  alpha[%-2s]   point %.3f   95%% CI [%.3f, %.3f]\n", g, alpha_pts[g], alpha_ci[1, g], alpha_ci[2, g]))
+    cat(sprintf("  %-11s point %6.2f    95%% CI [%6.2f, %6.2f]\n", "eta_median", eta_total_sample, eta_ci[1], eta_ci[2]))
+}
+```
+
+```{r fig-s9}
+## Inputs: block-level estimates and the decisions of each block
+block_estimates <- ohi_estimates_online
+n_blocks <- nrow(block_estimates)
+decisions <- data_decision_task_online %>% mutate(block = paste(participant_code, block_number))
+shares_by_block <- split(decisions$to_goal1_p, decisions$block)
+prices_by_block <- split(decisions$price_of_redist, decisions$block)
+
+## Covariance of (alpha, eta) per block: inverse observed information
+cov_by_block <- vector("list", n_blocks)
+held_fixed <- logical(n_blocks) # Blocks held at the point estimate
+grad_max <- rep(NA_real_, n_blocks) # Max. absolute gradient in (alpha, eta) at the estimate (convergence check)
+for (b in seq_len(n_blocks)) {
+    alpha_hat <- block_estimates$alpha[b]
+    eta_hat <- block_estimates$eta[b]
+    block_key <- paste(block_estimates$participant_code[b], block_estimates$task_number[b])
+    shares <- shares_by_block[[block_key]]
+    prices <- prices_by_block[[block_key]]
+    # Corner solutions and estimates on the boundary have no interior covariance
+    if (isTRUE(block_estimates$unipref[b] == 1) || alpha_hat <= 0 || alpha_hat >= 1 || eta_hat <= 0 || is.null(shares)) {
+        held_fixed[b] <- TRUE
+        next
+    }
+    block_nll <- function(par) nll(par, shares, prices)
+    log_sigma_hat <- optimize(function(log_sigma) block_nll(c(alpha_hat, eta_hat, log_sigma)), interval = c(-12, 5))$minimum
+    par_hat <- c(alpha_hat, eta_hat, log_sigma_hat)
+    grad_max[b] <- max(abs(fd_grad(block_nll, par_hat)[1:2]))
+    cov_full <- tryCatch(solve(fd_hessian(block_nll, par_hat)), error = function(e) NULL)
+    if (is.null(cov_full) || any(!is.finite(cov_full))) {
+        held_fixed[b] <- TRUE
+        next
+    }
+    V <- cov_full[1:2, 1:2]
+    if (V[1, 1] <= 0 || V[2, 2] <= 0 || (V[1, 1] * V[2, 2] - V[1, 2]^2) <= 0) { # Not positive definite
+        held_fixed[b] <- TRUE
+        next
+    }
+    cov_by_block[[b]] <- V
+}
+
+## Draws of (logit alpha, log eta), transformed back
+n_kr_draws <- 1000
+se_cap <- 5 # Blocks with a larger transformed SE are held at the point estimate
+set.seed(123)
+alpha_draws <- matrix(block_estimates$alpha, n_kr_draws, n_blocks, byrow = TRUE)
+eta_draws <- matrix(block_estimates$eta, n_kr_draws, n_blocks, byrow = TRUE)
+drawn <- logical(n_blocks)
+n_se_capped <- 0L
+for (b in which(!held_fixed)) {
+    alpha_hat <- block_estimates$alpha[b]
+    eta_hat <- block_estimates$eta[b]
+    V <- cov_by_block[[b]]
+    # Delta method: covariance of (logit alpha, log eta)
+    jacobian_alpha <- 1 / (alpha_hat * (1 - alpha_hat))
+    jacobian_eta <- 1 / eta_hat
+    cov_transformed <- matrix(c(V[1, 1] * jacobian_alpha^2, V[1, 2] * jacobian_alpha * jacobian_eta,
+                                V[1, 2] * jacobian_alpha * jacobian_eta, V[2, 2] * jacobian_eta^2), 2, 2)
+    if (sqrt(cov_transformed[1, 1]) > se_cap || sqrt(cov_transformed[2, 2]) > se_cap) {
+        n_se_capped <- n_se_capped + 1L
+        next
+    }
+    L <- tryCatch(chol(cov_transformed), error = function(e) NULL)
+    if (is.null(L)) next
+    G <- matrix(rnorm(n_kr_draws * 2), n_kr_draws, 2) %*% L
+    alpha_draws[, b] <- plogis(G[, 1] + qlogis(alpha_hat))
+    eta_draws[, b] <- exp(G[, 2] + log(eta_hat))
+    drawn[b] <- TRUE
+}
+
+## Fig. 2 quantities for every draw (row 1 = point estimate)
+kr <- matrix(NA_real_, n_kr_draws + 1, 3, dimnames = list(NULL, panels))
+alpha_goal_kr <- matrix(NA_real_, n_kr_draws + 1, length(goals), dimnames = list(NULL, goals))
+eta_med_kr <- numeric(n_kr_draws + 1)
+for (i in seq_len(n_kr_draws + 1)) {
+    estimates_i <- block_estimates
+    if (i > 1) {
+        estimates_i$alpha <- alpha_draws[i - 1, ]
+        estimates_i$eta <- eta_draws[i - 1, ]
+    }
+    res <- compute_fig2_summary(estimates_i)
+    kr[i, ] <- res$summary[panels]
+    alpha_goal_kr[i, ] <- res$alpha[goals]
+    eta_med_kr[i] <- res$eta
+}
+
+## Percentile CIs
+ci <- apply(kr[-1, , drop = FALSE], 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+alpha_ci <- apply(alpha_goal_kr[-1, , drop = FALSE], 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+eta_ci <- quantile(eta_med_kr[-1], probs = c(0.025, 0.975), na.rm = TRUE)
+
+cat(sprintf("Krinsky-Robb: %d blocks, %d drawn (%.0f%%), %d fixed (%d by se_cap = %g); max|grad(alpha,eta)| median=%.2g 90%%=%.2g\n",
+            n_blocks, sum(drawn), 100 * mean(drawn), sum(!drawn), n_se_capped, se_cap,
+            median(grad_max, na.rm = TRUE), quantile(grad_max, 0.9, na.rm = TRUE)))
+print_fig2_ci(ci, alpha_ci, eta_ci)
+
+# Row 1 reproduces the point estimates of Fig. 2
+stopifnot(abs(kr[1, "pct_change"] - pts["pct_change"]) < 1e-6,
+          abs(eta_med_kr[1] - eta_total_sample) < 1e-6,
+          max(abs(alpha_goal_kr[1, ] - alpha_pts)) < 1e-6)
+if (!(ci[1, "pct_change"] <= pts["pct_change"] && pts["pct_change"] <= ci[2, "pct_change"]))
+    warning("Krinsky-Robb 95% CI for Panel 2e does not bracket the point estimate.")
+if (!(eta_ci[1] <= eta_total_sample && eta_total_sample <= eta_ci[2]))
+    warning("Krinsky-Robb 95% CI for the Panel 2c eta does not bracket the point estimate.")
+
+build_fig2_ci_figure(ci, alpha_ci, eta_ci, "SI_Appendix_FigS9.pdf")
+```
+
+# SI Appendix Fig. S10: Fig. 2 with participant-bootstrap confidence intervals
+
+```{r fig-s10}
+# Sampling uncertainty: resample participants with replacement (with all of their decision blocks) and rerun the Fig. 2
+# aggregation for each resample
+n_boot <- 1000
+n_participants_boot <- n_distinct(block_estimates$participant_code)
+set.seed(123)
+boot_summary <- matrix(NA_real_, n_boot, length(panels), dimnames = list(NULL, panels))
+boot_alpha <- matrix(NA_real_, n_boot, length(goals), dimnames = list(NULL, goals))
+boot_eta <- numeric(n_boot)
+for (b in seq_len(n_boot)) {
+    res <- compute_fig2_summary(resample_participants(block_estimates))
+    boot_summary[b, ] <- res$summary[panels]
+    boot_alpha[b, ] <- res$alpha[goals]
+    boot_eta[b] <- res$eta
+}
+
+## Percentile CIs
+ci <- apply(boot_summary, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+alpha_ci <- apply(boot_alpha, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+eta_ci <- quantile(boot_eta, probs = c(0.025, 0.975), na.rm = TRUE)
+stopifnot(all(is.finite(ci)), all(is.finite(alpha_ci)), all(is.finite(eta_ci)))
+
+cat(sprintf("Participant bootstrap: %d resamples of %d participants (%d blocks)\n", n_boot, n_participants_boot, n_blocks))
+print_fig2_ci(ci, alpha_ci, eta_ci)
+
+build_fig2_ci_figure(ci, alpha_ci, eta_ci, "SI_Appendix_FigS10.pdf")
+```
+
+# SI Appendix Fig. S11: Fig. 2d and 2e at other percentiles of eta
+
+```{r fig-s11}
+# Panels d and e with eta at other percentiles of the block-level estimates; weights as in the main analysis
+eta_percentile_labels <- c("25th", "40th", "60th", "75th")
+eta_percentile_values <- quantile(ohi_estimates_online$eta, probs = c(0.25, 0.40, 0.60, 0.75))
+
+# Legend and margins of the stacked panel e
+fig_s11_e_style <- theme(
+    legend.position.inside = c(0.02, 0.98),
+    legend.justification.inside = c(0, 1),
+    legend.text = element_text(size = 6),
+    legend.spacing.y = unit(0, "mm"),
+    legend.key.height = unit(0.9, "lines"),
+    legend.key.width = unit(0.8, "lines"),
+    plot.margin = unit(c(0.05, 0.35, 0, 0), "cm"),
+    axis.title.x = element_text(size = 7, vjust = 6))
+
+set.seed(123) # jitter() in panel d
+fig_s11_rows <- list()
+for (i in seq_along(eta_percentile_values)) {
+    eta_value <- eta_percentile_values[[i]]
+    scores_at_eta <- OHI_table %>%
+        group_by(country) %>%
+        mutate(adjusted_OHI_etaonly = calculate_OHI_score(rep(0.1, 10), goal_score, eta_value),
+               adjusted_OHI = calculate_OHI_score(alpha_global, goal_score, eta_value)) %>%
+        ungroup() %>%
+        distinct(country, .keep_all = TRUE)
+
+    panel_d <- plot_score_shift(jitter_scores_long(scores_at_eta %>% mutate(adjusted_OHI = adjusted_OHI_etaonly)),
+                                "Substitutability-adjusted", "#08519c", label_y = 60)
+    # %-change label centred over the arrow between the two means
+    arrow_mid <- (mean(scores_at_eta$base_OHI) + mean(scores_at_eta$adjusted_OHI)) / 2
+    panel_e <- plot_ohi_density_panel(scores_at_eta, pct_x = arrow_mid, pct_hjust = 0.5) + fig_s11_e_style
+
+    # Row: percentile label, panel d, panel e
+    row_label <- ggdraw() +
+        draw_label(TeX(sprintf("$\\eta$ at %s percentile $= %.2f$", eta_percentile_labels[i], eta_value)),
+                   fontface = "bold", size = 8, angle = 90, x = 0.5, y = 0.5)
+    fig_s11_rows[[i]] <- plot_grid(row_label, plot_grid(panel_d, panel_e, ncol = 2, rel_widths = c(0.44, 0.56)),
+                                   ncol = 2, rel_widths = c(0.045, 1))
+}
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS11.pdf"),
+          plot = plot_grid(plotlist = fig_s11_rows, ncol = 1), base_width = 7.2, base_height = 6.69)
+```
+
+# SI Appendix Fig. S1: Country map
+
+```{r fig-s1}
+world <- ne_countries(returnclass = "sf") %>%
+    filter(admin != "Antarctica")
+
+# Survey countries
+map_countries <- c("United States of America", "France", "Australia", "Indonesia", "Canada", "Japan",
+                   "India", "Philippines", "China", "Peru", "Nigeria", "Germany")
+world <- world %>% mutate(in_sample = ifelse(admin %in% map_countries, 1, 0))
+
+map <- ggplot(world, aes(fill = as.factor(in_sample))) +
+  geom_sf(color = "NA") +
+  geom_text(x = 0, y = 60, label = "Germany", color = "#A4181D") +
+  geom_text(x = -20, y = 50, label = "France", color = "#A4181D") +
+  geom_text(x = -100, y = 40, label = "US", color = "lightgray") +
+  geom_text(x = -110, y = 55, label = "Canada", color = "lightgray") +
+  geom_text(x = -90, y = -10, label = "Peru", color = "#A4181D") +
+  geom_text(x = 0, y = 0, label = "Nigeria", color = "#A4181D") +
+  geom_text(x = 100, y = 35, label = "China", color = "lightgray") +
+  geom_text(x = 160, y = 40, label = "Japan", color = "#A4181D") +
+  geom_text(x = 60, y = 15, label = "India", color = "#A4181D") +
+  geom_text(x = 155, y = 5, label = "Philippines", color = "#A4181D") +
+  geom_text(x = 90, y = -10, label = "Indonesia", color = "#A4181D") +
+  geom_text(x = 135, y = -25, label = "Australia", color = "lightgray") +
+  scale_fill_manual(values = c("1" = "#A4181D", "0" = "lightgray")) +
+  theme(panel.background = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        aspect.ratio = 0.5)
+
+ggsave(map, filename = here("2_Graphs", "SI_Appendix_FigS1.pdf"), width = 6, height = 4)
+```
+
+# SI Appendix Fig. S2: Goal-pair estimates of alpha and eta
+
+```{r fig-s2}
+# Median alpha (as the weight on the alphabetically later goal, goal i) and median eta per goal pair
+pair_estimates <- ohi_estimates_online_eng %>%
+    separate_wider_delim(task_name, delim = "-", names = c("first_goal", "second_goal")) %>%
+    mutate(goal1 = pmax(first_goal, second_goal),
+           goal2 = pmin(first_goal, second_goal),
+           alpha = ifelse(first_goal == goal1, alpha, 1 - alpha)) %>%
+    group_by(goal1, goal2) %>%
+    summarize(median_alpha = round(median(alpha), 2),
+              median_eta = round(median(eta), 2),
+              .groups = "drop") %>%
+    bind_rows(tibble(goal1 = c("AO", "TR"), goal2 = c("AO", "TR"))) # Empty corner tiles for visual completeness
+
+heatmap_theme <- theme_basic +
+    theme(axis.line.y = element_blank(),
+          axis.line.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.y = element_text(size = 7),
+          axis.text.x = element_text(size = 7),
+          axis.title.y = element_text(size = 7),
+          axis.title.x = element_text(size = 7),
+          panel.grid.major.y = element_line(color = "lightgray", linewidth = 0.3),
+          panel.grid.major.x = element_line(color = "lightgray", linewidth = 0.3),
+          legend.position = "bottom",
+          legend.text = element_text(size = 7),
+          legend.title = element_text(size = 7),
+          plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+extdata_fig2_a <- ggplot(pair_estimates, aes(x = as.factor(goal2), y = forcats::fct_rev(as.factor(goal1)), fill = median_alpha)) +
+    geom_tile(height = 0.95, width = 0.95) + # Gaps between tiles keep the grid lines visible
+    geom_text(aes(label = median_alpha, color = ifelse(is.na(median_alpha) | median_alpha > 0.35, "white", "black")), size = 7 /.pt) +
+    scale_fill_distiller(palette = "Blues", direction = 1, na.value = NA, name = "Relative weight \n (Median alpha)",
+                         breaks = c(0.28, 0.5, 0.6)) +
+    scale_color_identity() +
+    labs(x = "Goal j", y = "Goal i") +
+    heatmap_theme +
+    scale_x_discrete(position = "top")
+
+stopifnot(max(pair_estimates$median_eta, na.rm = TRUE) <= 3.75, # Values outside the fill limits would render blank
+          min(pair_estimates$median_eta, na.rm = TRUE) >= 0)
+extdata_fig2_b <- ggplot(pair_estimates, aes(x = as.factor(goal2), y = forcats::fct_rev(as.factor(goal1)), fill = median_eta)) +
+    geom_tile(height = 0.95, width = 0.95) +
+    geom_text(aes(label = median_eta, color = ifelse(is.na(median_eta) | median_eta > 0, "white", "black")), size = 7 /.pt) +
+    scale_fill_distiller(palette = "Blues", direction = 1, na.value = NA, name = "Perceived complementarity \n (Median eta)",
+                         breaks = c(0, 3.75), limits = c(0, 3.75)) +
+    scale_color_identity() +
+    labs(x = "Goal j", y = "Goal i") +
+    heatmap_theme +
+    scale_x_discrete(position = "top")
+
+extdata_fig2 <- ggdraw() +
+   draw_plot(extdata_fig2_a, x = 0.03, y = 0, width = 0.47, height = 0.93, scale = 1) +
+   draw_plot(extdata_fig2_b, x = 0.52, y = 0, width = 0.45, height = 0.93, scale = 1) +
+   draw_plot_label(c("a", "b"), x = c(0, 0.5), y = c(1, 1), size = 10)
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS2.pdf"),
+          plot = extdata_fig2,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 5.2)
+```
+
+# SI Appendix Fig. S3: OHI scores before and after adjustment
+
+```{r fig-s3}
+# All countries get the overall preferences (as in Fig. 2e)
+extdata_fig3_table <- country_scores %>%
+    mutate(is_highlighted = country %in% sample_countries)
+
+extdata_fig3 <- ggplot(extdata_fig3_table, aes(x = base_OHI, y = adjusted_OHI_global)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", linewidth = 0.5, color = "lightgray") +
+    geom_point(data = filter(extdata_fig3_table, !is_highlighted), aes(color = "Non-sample countries"), size = 1) +
+    geom_point(data = filter(extdata_fig3_table, is_highlighted), aes(color = "Sample countries"), size = 2) +
+    # Labels of the sample countries
+    geom_text_repel(
+        position = position_nudge_to(x = 25, y = 75),
+        data = filter(extdata_fig3_table, is_highlighted),
+        aes(label = country),
+        box.padding = 0.4,
+        point.padding = 0.7,
+        color = "black",
+        size = 7 / .pt,
+        max.overlaps = Inf, direction = "y",
+        force = 1, force_pull = 1, max.time = 10, min.segment.length = 0,
+        seed = 42,
+        segment.size = 0.15, segment.color = "black", segment.linetype = "solid"
+    ) +
+    labs(x = "Base OHI score", y = "Adjusted OHI score", color = NULL) +
+    scale_color_manual(
+        values = c("Non-sample countries" = "#08306b", "Sample countries" = "#6baed6"),
+        breaks = c("Sample countries", "Non-sample countries")
+    ) +
+    scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 100), expand = c(0, 0)) +
+    theme_basic +
+    theme_axes +
+    theme(axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 1, size = 7, margin = margin(r = 2)),
+          axis.title.x = element_text(vjust = 5, size = 7),
+          axis.title.y = element_text(size = 7),
+          legend.position = "inside",
+          legend.position.inside = c(0.87, 0.1),
+          legend.background = element_rect(fill = "transparent", colour = "black", linewidth = 0.1, linetype = "solid"),
+          legend.text = element_text(size = 7))
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS3.pdf"),
+          plot = extdata_fig3,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 6.69)
+```
+
+# SI Appendix Fig. S4: Robustness of Fig. 2e
+
+## Panel a: All OHI countries, substitutability only
+
+```{r fig-s4-panel-a}
+# All countries with any goal score: equal weights over the reported goals and the overall median eta
+base_OHI_2022_all <- ohi_scores %>%
+    filter(scenario == 2022, goal == "Index", dimension == "score") %>%
+    select(country = region_name, base_OHI = value)
+
+extdata_fig4_a_data <- ohi_scores %>%
+    filter(scenario == 2022, goal %in% goals, dimension == "score") %>%
+    arrange(goal) %>%
+    mutate(value = ifelse(region_name %in% tr_imputed_countries & goal == "TR", 100, value)) %>%
+    filter(!is.na(value)) %>%
+    select(country = region_name, goal, goal_score = value) %>%
+    group_by(country) %>%
+    mutate(adjusted_OHI = calculate_OHI_score(1 / n(), goal_score, eta_total_sample)) %>%
+    ungroup() %>%
+    left_join(base_OHI_2022_all, by = "country") %>%
+    group_by(country) %>%
+    mutate(base_OHI = ifelse(country %in% tr_imputed_countries, mean(goal_score), base_OHI)) %>% # As in OHI_table
+    ungroup() %>%
+    distinct(country, .keep_all = TRUE)
+
+extdata_fig4_a <- plot_ohi_density_panel(extdata_fig4_a_data,
+    sprintf("All %d OHI countries (substitutability−adjustment only)", nrow(extdata_fig4_a_data)))
+
+# For text: paired t-test
+t.test(extdata_fig4_a_data$base_OHI, extdata_fig4_a_data$adjusted_OHI, paired = TRUE)
+```
+
+## Panel b: 2024 OHI scores
+
+```{r fig-s4-panel-b}
+# Overall preferences for all countries (drops Australia and Japan, which have no TR score in 2024)
+base_OHI_2024 <- ohi_scores %>%
+    filter(scenario == 2024, goal == "Index", dimension == "score", !is.na(value)) %>%
+    select(country = region_name, base_OHI = value)
+
+extdata_fig4_b_data <- ohi_scores %>%
+    filter(scenario == 2024, goal %in% goals, dimension == "score") %>%
+    arrange(goal) %>%
+    select(country = region_name, goal, goal_score = value) %>%
+    group_by(country) %>%
+    filter(!any(is.na(goal_score))) %>% # Drop countries with a missing goal score
+    mutate(alpha_global = alpha_total_sample$alpha_median[match(goal, alpha_total_sample$goal)],
+           adjusted_OHI = calculate_OHI_score(alpha_global, goal_score, eta_total_sample)) %>%
+    ungroup() %>%
+    left_join(base_OHI_2024, by = "country") %>%
+    arrange(country) %>%
+    distinct(country, .keep_all = TRUE)
+
+extdata_fig4_b <- plot_ohi_density_panel(extdata_fig4_b_data, "Post-COVID robustness check (2024 OHI scores)", pct_x = 50)
+```
+
+## Panel c: Preferences of coastal-affine participants
+
+```{r fig-s4-panel-c}
+# Coastal affinity: more than 10 days per year at the coast
+coastal_data <- ohi_estimates_online %>%
+    inner_join(survey_data %>% select(participant_code, days_at_sea, session_label), by = "participant_code", multiple = "any") %>%
+    mutate(coast_native = ifelse(days_at_sea > 10, 1, 0))
+
+# For text: median alpha and eta (decision-block level) by coastal affinity
+coastal_data %>%
+    group_by(coast_native) %>%
+    summarize(median_eta = median(eta, na.rm = TRUE), median_alpha = median(alpha, na.rm = TRUE))
+
+# For text: median regression of log(eta_n) on coastal affinity with country fixed effects, one observation per
+# participant
+coastal_participant_level <- to_participant_level(coastal_data, coast_native, session_label)
+stopifnot(all(coastal_participant_level$eta > 0)) # log(eta) must be finite
+coastal_participant_level %>%
+    group_by(coast_native) %>%
+    summarize(median_eta_n = median(eta), n_participants = n())
+coastal_regeta <- rq(log(eta) ~ coast_native + session_label, tau = 0.5, data = coastal_participant_level)
+print(summary(coastal_regeta)$coefficients["coast_native", ])
+print(broom::tidy(coastal_regeta, conf.int = TRUE) %>% filter(term == "coast_native"))
+
+# All countries get the preferences of the coastal-affine participants
+coastal_alpha <- retrieve_alphas(filter(coastal_data, coast_native == 1))
+coastal_eta <- median(filter(coastal_data, coast_native == 1)$eta, na.rm = TRUE)
+extdata_fig4_c_data <- OHI_table %>%
+    mutate(alpha_coastal = coastal_alpha$alpha_median[match(goal, coastal_alpha$goal)]) %>%
+    group_by(country) %>%
+    mutate(adjusted_OHI = calculate_OHI_score(alpha_coastal, goal_score, coastal_eta)) %>%
+    ungroup() %>%
+    distinct(country, .keep_all = TRUE)
+
+extdata_fig4_c <- plot_ohi_density_panel(extdata_fig4_c_data, "Only coastal-affine participants (>10 days at the coast)", pct_x = 62)
+```
+
+## Panel d: Mean instead of median preferences
+
+```{r fig-s4-panel-d}
+# The mean of the block-level eta diverges (extreme right tail), so the CES aggregation reaches its Leontief limit:
+# the adjusted score is the minimum goal score
+eta_total_sample_mean <- mean(ohi_estimates_online$eta)
+cat(sprintf("Fig. S4d mean-aggregation: mean eta = %s (median eta = %.2f) -> Leontief (min goal score)\n",
+            format(eta_total_sample_mean, scientific = TRUE, digits = 4), eta_total_sample))
+
+extdata_fig4_d_data <- OHI_table %>%
+    group_by(country) %>%
+    mutate(adjusted_OHI = min(goal_score)) %>%
+    ungroup() %>%
+    distinct(country, .keep_all = TRUE)
+
+extdata_fig4_d <- plot_ohi_density_panel(extdata_fig4_d_data, "Mean preferences instead of median preferences", pct_x = 52)
+```
+
+## Save Fig. S4
+
+```{r fig-s4-save}
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS4.pdf"),
+          plot = stack_four_panels(extdata_fig4_a, extdata_fig4_b, extdata_fig4_c, extdata_fig4_d),
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 6.69)
+```
+
+# For text (Methods): Social-choice interpretation
+
+```{r social-choice}
+# Weights fixed at the overall sample weights; countries of Fig. 2e. calculate_OHI_score() over- or underflows for the
+# extreme right tail of eta (up to ~1e15), so the scores use the identical form m * (sum(alpha * (x/m)^(1-eta)))^(1/(1-eta))
+# with m = min(x), vectorized over eta
+ces_score_by_eta <- function(alpha_vector, score_vector, eta) {
+    m <- min(score_vector)
+    if (m == 0) { # A zero goal score gives a score of 0 for eta >= 1; below 1 the plain formula is stable
+        out <- rep(0, length(eta))
+        below_one <- eta < 1
+        out[below_one] <- colSums(alpha_vector * outer(score_vector, 1 - eta[below_one], `^`))^(1 / (1 - eta[below_one]))
+        return(out)
+    }
+    out <- m * as.vector(exp(outer(1 - eta, log(score_vector / m))) %*% alpha_vector)^(1 / (1 - eta))
+    out[eta == 1] <- exp(sum(alpha_vector * log(score_vector)) / sum(alpha_vector))
+    out
+}
+
+# Goal-score matrix (countries x goals), weights and baseline index
+sc_scores <- OHI_table %>%
+    select(country, goal, goal_score) %>%
+    pivot_wider(names_from = goal, values_from = goal_score)
+sc_goal_matrix <- as.matrix(sc_scores[, -1])
+rownames(sc_goal_matrix) <- sc_scores$country
+sc_alpha <- alpha_total_sample$alpha_median[match(colnames(sc_goal_matrix), alpha_total_sample$goal)]
+sc_base <- OHI_table$base_OHI[match(rownames(sc_goal_matrix), OHI_table$country)]
+sc_pct_change <- function(adjusted) (1 - mean(adjusted) / mean(sc_base)) * -100
+sc_implied_scores <- function(eta) { # countries x eta
+    t(matrix(vapply(seq_len(nrow(sc_goal_matrix)), function(k) ces_score_by_eta(sc_alpha, sc_goal_matrix[k, ], eta), numeric(length(eta))),
+             nrow = length(eta), dimnames = list(NULL, rownames(sc_goal_matrix))))
+}
+
+# Decision-block (eta_ng) and participant-level (eta_n) parameters
+sc_eta_blocks <- ohi_estimates_online$eta
+sc_eta_participants <- eta_participant_level$eta
+sc_scores_blocks <- sc_implied_scores(sc_eta_blocks)
+sc_scores_at_median <- sc_implied_scores(median(sc_eta_blocks))[, 1]
+stopifnot(isTRUE(all.equal(unname(sc_scores_at_median), country_scores$adjusted_OHI_global[match(rownames(sc_goal_matrix), country_scores$country)]))) # Same scores as Fig. 2e
+
+# (1) Order of aggregation. Median: the score at the median eta equals the median of the implied scores. Mean: the
+# score at the mean eta (Fig. S4d) differs from the mean of the implied scores.
+cat(sprintf("Social choice (1) median: max |median of block-implied scores - score at median eta| = %.2g\n",
+            max(abs(apply(sc_scores_blocks, 1, median) - sc_scores_at_median))))
+cat(sprintf("Social choice (1) mean: score at mean eta (Fig. S4d, Leontief) %+.1f%% | mean of implied scores over decision blocks %+.1f%% | over participants (score at own eta_n) %+.1f%%\n",
+            sc_pct_change(extdata_fig4_d_data$adjusted_OHI[match(rownames(sc_goal_matrix), extdata_fig4_d_data$country)]),
+            sc_pct_change(rowMeans(sc_scores_blocks)),
+            sc_pct_change(rowMeans(sc_implied_scores(sc_eta_participants)))))
+
+# (2) Median of the decision-block estimates vs. median of the participant-level parameters
+cat(sprintf("Social choice (2): median eta_ng = %.2f (%d decision blocks) vs. median eta_n = %.2f (%d participants)\n",
+            median(sc_eta_blocks), length(sc_eta_blocks), median(sc_eta_participants), length(sc_eta_participants)))
+
+# (3) Single crossing. Participant n ranks country A above B iff d_AB(eta_n) > 0. Per country pair: number of sign
+# changes of d_AB over the sorted eta_n (differences below 1e-6 are ties), whether the participant majority contradicts
+# the ranking at the median eta_n, and the three-country Condorcet cycles of the majority relation
+sc_rank_scores <- sc_implied_scores(sort(sc_eta_participants))
+sc_at_median_n <- sc_implied_scores(median(sc_eta_participants))[rownames(sc_rank_scores), 1]
+sc_n <- nrow(sc_rank_scores)
+sc_wins <- matrix(0, sc_n, sc_n)
+sc_single_crossing <- 0
+sc_reversals <- 0
+for (i in 1:(sc_n - 1)) for (j in (i + 1):sc_n) {
+    d_ab <- sc_rank_scores[i, ] - sc_rank_scores[j, ]
+    sign_changes <- sum(diff(sign(d_ab[abs(d_ab) > 1e-6])) != 0)
+    sc_single_crossing <- sc_single_crossing + (sign_changes <= 1)
+    majority <- sign(sum(d_ab > 0) - sum(d_ab < 0))
+    if (majority > 0) sc_wins[i, j] <- 1 else if (majority < 0) sc_wins[j, i] <- 1
+    at_median <- sign(sc_at_median_n[i] - sc_at_median_n[j])
+    sc_reversals <- sc_reversals + (majority != 0 && at_median != 0 && majority != at_median)
+}
+sc_pairs <- choose(sc_n, 2)
+sc_tied_pairs <- sum(upper.tri(sc_wins) & sc_wins == 0 & t(sc_wins) == 0) # Pairs without a strict majority
+# Directed 3-cycles i->j->k->i or i->k->j->i over all triples i < j < k
+sc_cycles <- 0
+for (i in 1:(sc_n - 2)) for (j in (i + 1):(sc_n - 1)) {
+    k <- (j + 1):sc_n
+    sc_cycles <- sc_cycles + sum(sc_wins[i, j] * sc_wins[j, k] * sc_wins[k, i] +
+                                 sc_wins[i, k] * sc_wins[k, j] * sc_wins[j, i])
+}
+cat(sprintf("Social choice (3): d_AB changes sign at most once over the observed eta_n for %d of %d country pairs (%.1f%%); %d pairs (%.1f%%) where the participant majority contradicts the ranking at the median eta_n; %d three-country Condorcet cycles (%d countries)\n",
+            sc_single_crossing, sc_pairs, 100 * sc_single_crossing / sc_pairs, sc_reversals, 100 * sc_reversals / sc_pairs,
+            sc_cycles, sc_n))
+cat(sprintf("  %d of %d country pairs have no strict majority (tied)\n", sc_tied_pairs, sc_pairs))
+```
+
+# For text and SI Appendix Tab. S4: Endogeneity of the preferences
+
+## Substitutability eta
+
+```{r endogeneity-eta}
+# Median regression of the block-level log eta on the sum and the absolute difference of the two goals' 2022 scores in
+# the participant's country, with goal-pair and country fixed effects and bootstrap SEs clustered by country:
+#   ln eta_ng = theta (x_ic + x_jc) + phi |x_ic - x_jc| + pair FE + country FE + e_ng
+n_boot_endog <- 200
+eta_endog_data <- alpha_score_regression_data %>%
+    mutate(score_sum = goal1_score + goal2_score,
+           score_absdiff = abs(goal1_score - goal2_score),
+           pair = factor(ifelse(goal1 < goal2, paste(goal1, goal2, sep = "-"), paste(goal2, goal1, sep = "-"))),
+           country_code = factor(country_code))
+stopifnot(!anyNA(eta_endog_data$score_sum), all(eta_endog_data$eta > 0))
+
+eta_endog_model <- rq(log(eta) ~ score_sum + score_absdiff + pair + country_code, tau = 0.5, data = eta_endog_data, method = "fn")
+set.seed(123)
+eta_endog_coef <- summary(eta_endog_model, se = "boot", cluster = eta_endog_data$country_code, R = n_boot_endog)$coefficients
+
+n_countries_endog <- nlevels(eta_endog_data$country_code)
+eta_endog <- tibble(term = c("score_sum", "score_absdiff"),
+                    estimate = eta_endog_coef[term, 1],
+                    std.error = eta_endog_coef[term, 2],
+                    p.value = 2 * pt(-abs(estimate / std.error), df = n_countries_endog - 1),
+                    n_blocks = nrow(eta_endog_data),
+                    n_participants = n_distinct(eta_endog_data$participant_code),
+                    n_countries = n_countries_endog)
+cat(sprintf("Eta endogeneity, %s: coefficient %.5f (%+.1f%% eta per 10 score points), p = %.3f (%d blocks, %d countries)\n",
+            c("theta (sum of goal scores)", "phi (absolute difference of goal scores)"), eta_endog$estimate,
+            100 * (exp(10 * eta_endog$estimate) - 1), eta_endog$p.value, eta_endog$n_blocks, eta_endog$n_countries), sep = "")
+```
+
+## Weights alpha
+
+```{r endogeneity-alpha}
+# Median regression of the block-level weight on goal 1 on the difference between the two goals' 2022 scores in the
+# participant's country, with fixed effects for the ordered goal pair and bootstrap SEs clustered by country:
+#   alpha_ng = gamma (x_ic - x_jc) + pair FE + e_ng
+alpha_endog_data <- alpha_score_regression_data %>%
+    mutate(score_diff = goal1_score - goal2_score,
+           pair = factor(paste(goal1, goal2, sep = "-")), # Ordered, as alpha refers to goal 1
+           country_code = factor(country_code))
+stopifnot(!anyNA(alpha_endog_data$score_diff))
+
+alpha_endog_model <- rq(alpha ~ score_diff + pair, tau = 0.5, data = alpha_endog_data, method = "fn")
+set.seed(123)
+alpha_endog_coef <- summary(alpha_endog_model, se = "boot", cluster = alpha_endog_data$country_code, R = n_boot_endog)$coefficients
+
+alpha_endog <- tibble(term = "score_diff",
+                      estimate = alpha_endog_coef[term, 1],
+                      std.error = alpha_endog_coef[term, 2],
+                      p.value = 2 * pt(-abs(estimate / std.error), df = nlevels(alpha_endog_data$country_code) - 1),
+                      n_blocks = nrow(alpha_endog_data),
+                      n_participants = n_distinct(alpha_endog_data$participant_code),
+                      n_countries = nlevels(alpha_endog_data$country_code))
+cat(sprintf("Alpha endogeneity, gamma (difference of goal scores): coefficient %.6f (%+.4f alpha per 10 score points), p = %.3f (%d blocks, %d countries)\n",
+            alpha_endog$estimate, 10 * alpha_endog$estimate, alpha_endog$p.value, alpha_endog$n_blocks, alpha_endog$n_countries))
+```
+
+# SI Appendix Fig. S5: Demographics and goal weights
+
+```{r fig-s5}
+extdata_fig5_data <- add_survey_data(ohi_estimates_online_eng)
+
+# Median regression of the weight on each goal, with country fixed effects
+models <- list()
+extdata_fig5_regression_data <- list() # Data of each model (participant clusters and SI Appendix Tab. S3)
+goal_codes_sorted <- sort(goals)
+for (goal_i in goal_codes_sorted) {
+    # Blocks with the current goal, with alpha as the weight on that goal
+    current_goal_table <- extdata_fig5_data %>%
+        filter(str_detect(task_name, goal_i)) %>%
+        mutate(alpha = ifelse(grepl(paste0(goal_i, "-"), task_name), alpha, 1 - alpha))
+    models[[goal_i]] <- rq(alpha ~ age + gender + days_at_sea + ocean_health_importance + session_label,
+                           tau = 0.5, current_goal_table)
+    extdata_fig5_regression_data[[goal_i]] <- current_goal_table
+}
+
+# Confidence intervals from bootstrap SEs clustered by participant (wild gradient bootstrap of Hagemann (2017))
+n_boot_rq <- 200
+set.seed(123)
+extdata_fig5_coef <- purrr::imap_dfr(
+    models, ~ broom::tidy(.x, se.type = "boot", conf.int = TRUE, R = n_boot_rq,
+                          cluster = extdata_fig5_regression_data[[.y]]$participant_code), .id = "model") %>%
+    filter(term %in% demographics_terms) %>%
+    mutate(model = factor(model, levels = rev(goal_codes_sorted)),
+           term = factor(term, levels = demographics_terms))
+
+extdata_fig5 <- ggplot(extdata_fig5_coef, aes(x = estimate, y = model, xmin = conf.low, xmax = conf.high, color = term)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey", linewidth = 0.3) +
+    geom_pointrange(position = position_dodge(width = 0.7), size = 0.01, linewidth = 0.3) +
+    # Estimates and CIs next to the dodged points
+    geom_text(
+        aes(x = estimate,
+            y = as.numeric(model) + ifelse(term == "age", 0.35, ifelse(term == "genderfemale", 0.18, ifelse(term == "days_at_sea", -0.0, -0.17))),
+            label = round(estimate, 3)),
+        inherit.aes = FALSE, hjust = 0.5, size = 6 /.pt, color = "black") +
+    geom_text(
+        aes(x = -0.09,
+            y = as.numeric(model) + ifelse(term == "age", 0.35, ifelse(term == "genderfemale", 0.17, ifelse(term == "days_at_sea", -0.02, -0.2))),
+            label = paste0("CI: [", round(conf.low, 3), "; ", round(conf.high, 3), "]")),
+        inherit.aes = FALSE, hjust = 0, size = 7 /.pt, color = "black") +
+    scale_color_manual(
+        values = c("ocean_health_importance" = "#D55E00", "genderfemale" = "#F5C710", "days_at_sea" = "#0072B2", "age" = "#009E73"),
+        labels = demographics_labels,
+        name = NULL,
+        guide = guide_legend(reverse = TRUE)
+    ) +
+    labs(y = "Goal", x = TeX("$\\alpha_{ng}$")) +
+    scale_x_continuous(limits = c(-0.1, 0.1), expand = c(0, 0)) +
+    theme_basic +
+    theme_axes +
+    theme(axis.text.y = element_text(angle = 0, hjust = 1, vjust = 0.5, size = 7, margin = margin(r = 2)),
+          axis.text.x = element_text(vjust = 6, size = 7),
+          axis.title.y = element_text(size = 7),
+          axis.title.x = element_text(vjust = 4, size = 7),
+          legend.position = "inside",
+          legend.position.inside = c(0.9, 0.1),
+          legend.text = element_text(size = 7))
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS5.pdf"),
+          plot = extdata_fig5,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 6.69) # 17cm in inch (maximal allowed height)
+```
+
+# SI Appendix Fig. S6: Country vs. global preferences of the sample countries
+
+```{r fig-s6}
+# Theme of the scatter plots in Figs. S6 and S7
+scatter_theme <- theme_basic +
+    theme_axes +
+    theme(axis.text.x = element_text(vjust = 6, size = 7),
+          axis.text.y = element_text(hjust = 1, size = 7, margin = margin(r = 2)),
+          axis.title.x = element_text(vjust = 4, size = 7),
+          axis.title.y = element_text(size = 7),
+          legend.position = "none",
+          plot.margin = unit(c(0.2, 0.25, 0.2, 0.1), "cm"))
+
+## Panel a: score changes
+panel_fig4_a_scatter_data <- panel_fig4_a_data %>% distinct(country, .keep_all = TRUE)
+
+panel_fig4_a_scatter <- ggplot(panel_fig4_a_scatter_data, aes(x = change_global, y = change)) +
+    annotate("polygon", x = c(-30, 0, -30), y = c(-30, 0, 0), fill = scales::alpha("#009E73", 0.18), color = NA) +
+    annotate("polygon", x = c(-30, 0, 0), y = c(-30, -30, 0), fill = scales::alpha("#D55E00", 0.18), color = NA) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.2, color = "grey50") +
+    geom_point(size = 1, color = "black") +
+    geom_text_repel(aes(label = country_code), size = 7 /.pt, color = "black", max.overlaps = Inf, box.padding = 0.1, point.padding = 0.0, seed = 1) +
+    annotate("label", x = -1, y = -29, label = "Scores higher under global preferences", hjust = 1, vjust = 0, size = 2.4, label.size = 0.25, fill = "white", color = "black") +
+    annotate("label", x = -29, y = -1, label = "Scores higher under country preferences", hjust = 0, vjust = 1, size = 2.4, label.size = 0.25, fill = "white", color = "black") +
+    labs(x = "Change in OHI score using global preferences", y = "Change in OHI score using country preferences") +
+    scale_x_continuous(limits = c(-30, 0), breaks = seq(-30, 0, 5), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(-30, 0), breaks = seq(-30, 0, 5), expand = c(0, 0)) +
+    coord_equal(xlim = c(-30, 0), ylim = c(-30, 0), clip = "off") +
+    scatter_theme
+
+## Panel b: rank changes (ranks among all countries)
+panel_fig4_a_rank_data <- country_scores %>%
+    mutate(baseline_rank = rank(-base_OHI, ties.method = "min"),
+           country_rank = rank(-adjusted_OHI, ties.method = "min"),
+           global_rank = rank(-adjusted_OHI_global, ties.method = "min")) %>%
+    filter(country %in% sample_countries) %>%
+    mutate(change_global_rank = baseline_rank - global_rank,
+           change_country_rank = baseline_rank - country_rank)
+
+rank_limits <- c(-80, 80)
+panel_fig4_a_rank_scatter <- ggplot(panel_fig4_a_rank_data, aes(x = change_global_rank, y = change_country_rank)) +
+    annotate("polygon", x = c(-80, 80, -80), y = c(-80, 80, 80), fill = scales::alpha("#009E73", 0.18), color = NA) +
+    annotate("polygon", x = c(-80, 80, 80), y = c(-80, -80, 80), fill = scales::alpha("#D55E00", 0.18), color = NA) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.2, color = "grey50") +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.2, color = "grey50") +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.2, color = "grey50") +
+    geom_point(size = 1, color = "black") +
+    geom_text_repel(aes(label = country_code), size = 7 /.pt, color = "black", max.overlaps = Inf, box.padding = 0.1, point.padding = 0.0, seed = 1) +
+    annotate("label", x = -75, y = 75, label = "Ranks higher under country preferences", hjust = 0, vjust = 1, size = 2.4, label.size = 0.25, fill = "white", color = "black") +
+    annotate("label", x = 75, y = -75, label = "Ranks higher under global preferences", hjust = 1, vjust = 0, size = 2.4, label.size = 0.25, fill = "white", color = "black") +
+    labs(x = "Change in country rank using global preferences", y = "Change in country rank using country preferences") +
+    scale_x_continuous(limits = rank_limits, breaks = seq(-80, 80, 20), expand = c(0, 0)) +
+    scale_y_continuous(limits = rank_limits, breaks = seq(-80, 80, 20), expand = c(0, 0)) +
+    coord_equal(xlim = rank_limits, ylim = rank_limits, clip = "off") +
+    scatter_theme +
+    theme(aspect.ratio = 1)
+
+extdata_fig6 <- ggdraw() +
+   draw_plot(panel_fig4_a_scatter, x = 0.02, y = 0.03, width = 0.46, height = 0.92, scale = 1) +
+   draw_plot(panel_fig4_a_rank_scatter, x = 0.52, y = 0.03, width = 0.46, height = 0.92, scale = 1) +
+   draw_plot_label(c("a", "b"), x = c(0, 0.50), y = c(1, 1), size = 10)
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS6.pdf"),
+          plot = extdata_fig6,
+          base_width = 7.2, # 18.3cm in inch
+          base_height = 3.2)
+```
+
+# SI Appendix Fig. S7: Preferences and OHI scores
+
+```{r fig-s7}
+# Format a p-value, with "p < 0.001" for very small values
+format_p <- function(p) if (p < 0.001) "p < 0.001" else sprintf("p = %.2f", p)
+
+## Panel a: goal weights vs. goal scores of the sample countries
+goal_alpha_score_data <- OHI_table %>%
+    filter(country %in% sample_countries) %>%
+    select(country, country_code, goal, goal_score, alpha_median) %>%
+    filter(!is.na(goal_score), !is.na(alpha_median))
+
+# Pooled correlation and within-goal slope (goal fixed effects); p-values clustered by country, as the weights of a
+# country come from the same participants and sum to 1
+alpha_r <- cor(goal_alpha_score_data$alpha_median, goal_alpha_score_data$goal_score, method = "pearson")
+alpha_pooled_model <- lm(alpha_median ~ goal_score, data = goal_alpha_score_data)
+alpha_p <- cluster_robust_coefs(alpha_pooled_model, goal_alpha_score_data$country_code) %>%
+    filter(term == "goal_score") %>% pull(p.value)
+
+alpha_fe_model <- lm(alpha_median ~ goal_score + factor(goal), data = goal_alpha_score_data)
+alpha_fe_slope <- coef(alpha_fe_model)[["goal_score"]]
+alpha_fe_p <- cluster_robust_coefs(alpha_fe_model, goal_alpha_score_data$country_code) %>%
+    filter(term == "goal_score") %>% pull(p.value)
+
+# Within-goal correlation: correlation of the goal-demeaned variables
+alpha_r_within <- goal_alpha_score_data %>%
+    group_by(goal) %>%
+    mutate(alpha_dm = alpha_median - mean(alpha_median),
+           score_dm = goal_score - mean(goal_score)) %>%
+    ungroup() %>%
+    summarise(r = cor(alpha_dm, score_dm)) %>%
+    pull(r)
+
+# Within-goal slope drawn through the grand means
+alpha_fe_intercept <- mean(goal_alpha_score_data$alpha_median) - alpha_fe_slope * mean(goal_alpha_score_data$goal_score)
+
+panel_extdata_fig7_alpha <- ggplot(goal_alpha_score_data, aes(x = goal_score, y = alpha_median)) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.3, color = "#D55E00") +
+    geom_abline(intercept = alpha_fe_intercept, slope = alpha_fe_slope, linewidth = 0.3, linetype = "dashed", color = "#0072B2") +
+    geom_point(size = 1, color = "black", alpha = 0.6) +
+    annotate("text", x = Inf, y = Inf, label = sprintf("Pooled: r = %.2f (%s)", alpha_r, format_p(alpha_p)), hjust = 1.05, vjust = 1.6, size = 7 /.pt, color = "#D55E00") +
+    annotate("text", x = Inf, y = Inf, label = sprintf("Within goal: r = %.2f (%s)", alpha_r_within, format_p(alpha_fe_p)), hjust = 1.05, vjust = 3.1, size = 7 /.pt, color = "#0072B2") +
+    labs(x = "OHI goal score (2022)", y = expression(paste("Weighting estimate (", alpha, ")"))) +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+    scale_y_continuous(expand = expansion(mult = c(0.03, 0.08))) +
+    scatter_theme
+
+## Panel b: median eta vs. baseline OHI score of the sample countries
+country_correlation_data <- estimates_wcountry %>%
+    group_by(country_abrv, country = region_name) %>%
+    summarise(median_eta = median(eta, na.rm = TRUE), .groups = "drop") %>%
+    left_join(country_scores %>% select(country, base_OHI), by = "country") # Baseline incl. the recomputed index of the TR-imputed countries
+eta_r <- cor(country_correlation_data$median_eta, country_correlation_data$base_OHI, method = "pearson")
+
+# For text: Pearson correlation test (n = 12 countries)
+print(cor.test(country_correlation_data$median_eta, country_correlation_data$base_OHI, method = "pearson"))
+
+panel_extdata_fig7_eta <- ggplot(country_correlation_data, aes(x = base_OHI, y = median_eta)) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.3, color = "#D55E00") +
+    geom_point(size = 1, color = "black") +
+    geom_text_repel(aes(label = country_abrv), size = 7 /.pt, color = "black", max.overlaps = Inf, box.padding = 0.1, point.padding = 0.0, seed = 1) +
+    annotate("text", x = Inf, y = -Inf, label = sprintf("Pearson r = %.2f", eta_r), hjust = 1.05, vjust = -0.8, size = 7 /.pt) +
+    labs(x = "OHI score (2022)", y = "Median eta") +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+    scale_y_continuous(expand = expansion(mult = c(0.03, 0.08))) +
+    scatter_theme
+
+extdata_fig7 <- ggdraw() +
+    draw_plot(panel_extdata_fig7_alpha, x = 0.02, y = 0.03, width = 0.46, height = 0.92, scale = 1) +
+    draw_plot(panel_extdata_fig7_eta, x = 0.52, y = 0.03, width = 0.46, height = 0.92, scale = 1) +
+    draw_plot_label(c("a", "b"), x = c(0, 0.50), y = c(1, 1), size = 10)
+
+save_plot(filename = here("2_Graphs", "SI_Appendix_FigS7.pdf"),
+          plot = extdata_fig7,
+          base_width = 7.2,
+          base_height = 3.2)
+```
+
+# SI Appendix Tab. S1: Descriptive statistics
+
+```{r tab-s1}
+extdata_table_1_data <- survey_data %>%
+    filter(participant_code %in% main_sample_subject_selection$participant_code)
+
+extdata_table_1 <- extdata_table_1_data %>%
+    mutate(Country = ifelse(session_label == "usa", "USA", str_to_title(session_label))) %>%
+    group_by(Country) %>%
+    summarize(
+        N = n(),
+        `Male` = sum(gender == "male"),
+        `Female` = sum(gender == "female"),
+        `Mean` = mean(age),
+        `SD` = sd(age),
+        `Min` = min(age),
+        `Max` = max(age)
+    )
+
+kable(extdata_table_1, format = "latex", booktabs = TRUE, escape = F, linesep = "\\addlinespace", align = c(rep('l', ncol(extdata_table_1))), digits = 2,
+      col.names = c("Country / Variable", "N", "Male", "Female", "Mean", "SD", "Min", "Max")) %>%
+    add_header_above(c(" " = 2, "Gender" = 2, "Age" = 4)) %>%
+    save_kable(file = here("2_Graphs", "SI_Appendix_TabS1.tex"))
+```
+
+# SI Appendix Tab. S2: Preferences and goal scores of the sample countries
+
+```{r tab-s2}
+# Sample countries plus "All": the officially reported global average goal scores with the overall preferences
+extdata_tab2_data <- OHI_table %>%
+    filter(country %in% sample_countries) %>%
+    bind_rows(
+        ohi_scores_global_average %>%
+            filter(scenario == 2022, goal %in% goals, dimension == "score") %>%
+            transmute(country_code = "All",
+                      goal,
+                      goal_score = value,
+                      eta_median = eta_total_sample,
+                      alpha_median = alpha_total_sample$alpha_median[match(goal, alpha_total_sample$goal)])) %>%
+    mutate(eta_median = round(eta_median, 2),
+           alpha_median = round(alpha_median, 3)) %>%
+    select(country_code, goal, goal_score, eta_median, alpha_median)
+
+# Cells "goal score (alpha)", goals as rows and countries as columns
+extdata_tab2_data <- extdata_tab2_data %>%
+    unite(goal_value, goal_score, alpha_median, sep = "\n (") %>%
+    mutate(goal_value = linebreak(paste(goal_value, ")", sep = ""), align = "l"))
+
+extdata_tab2_data_wide <- extdata_tab2_data %>%
+    rename(Eta = eta_median) %>%
+    spread(key = goal, value = goal_value) %>%
+    data.table::transpose(keep.names = "country_code", make.names = "country_code") %>%
+    rename(`''` = country_code)
+
+kable(extdata_tab2_data_wide, format = "latex",
+      booktabs = TRUE,
+      escape = F,
+      linesep = "\\addlinespace", # Increase space between rows
+      align = c(rep('l', ncol(extdata_tab2_data_wide)))) %>%
+    kable_styling(latex_options = c("hold_position"), font_size = 8) %>%
+    save_kable(file = here("2_Graphs", "SI_Appendix_TabS2.tex"))
+```
+
+# SI Appendix Tab. S3: Samples underlying each test and claim
+
+```{r tab-s3}
+# One row per statistic, test or estimator: the unit of observation, the number of units (N), and the decision blocks,
+# participants and countries behind it. All counts come from the data objects of the respective analyses.
+
+# Format a count (or the range of several counts) with thousands separators
+fmt_n <- function(x) {
+    x <- range(x)
+    if (x[1] == x[2]) formatC(x[1], format = "d", big.mark = ",") else paste(formatC(x, format = "d", big.mark = ","), collapse = "--")
+}
+rq_rows <- function(model, data) if (length(model$na.action)) data[-model$na.action, ] else data # Rows used by an rq() fit
+blocks_of <- function(prep) fmt_n(nrow(prep$ohi_estimates_online))
+participants_of <- function(prep) fmt_n(n_distinct(prep$ohi_estimates_online$participant_code))
+countries_of <- function(prep) fmt_n(n_distinct(prep$OHI_table$country))
+
+# Main sample and the countries whose OHI scores are recalculated with the main-sample preferences
+blocks_main <- blocks_of(main_prep)
+participants_main <- participants_of(main_prep)
+survey_countries <- fmt_n(n_distinct(estimates_wcountry$country_abrv))
+countries_main <- fmt_n(nrow(country_scores))
+
+# Samples of specific analyses
+fig4b_countries_per_year <- OHI_table_allyears %>%
+    filter(country != "Global average") %>%
+    count(year) %>%
+    pull(n)
+oecd_n <- table(estimates_oecdtype_country_level$country_type)
+fig4d_data <- rq_rows(panel_fig4_d_regeta, panel_fig4_d_data)
+coastal_rq_data <- rq_rows(coastal_regeta, coastal_participant_level)
+coastal_n <- table(coastal_rq_data$coast_native)
+fig5_data <- purrr::imap(models, ~ rq_rows(.x, extdata_fig5_regression_data[[.y]]))
+fig_s4a_pairs <- sum(complete.cases(extdata_fig4_a_data$base_OHI, extdata_fig4_a_data$adjusted_OHI)) # Pairs of the paired t-test
+n_synthetic_blocks <- sum(is.na(synthetic_fill_prep$ohi_estimates_online$task_name))
+
+sample_overview <- tribble(
+    ~group, ~claim, ~reference, ~test, ~unit, ~n, ~blocks, ~participants, ~countries,
+    "Sample", "Final sample", "Methods", "Descriptive", NA,
+        NA, blocks_main, participants_main, NA,
+    "Figure 2", "Goal weights $\\alpha_i$", "Fig. 2a", "Logarithmic least-squares approximation based on goal-pair medians of $\\alpha_{ng}$", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, NA,
+    "Figure 2", "Goal weights differ from equal weighting", "Fig. 2a; text", "Two-sided bootstrap-t tests (H$_0$: $\\alpha_i = 1/10$), clustered by participant (participant-level resampling)", "Bootstrapped t-statistics per $\\alpha_i$",
+        fmt_n(B_outer), blocks_main, participants_main, NA,
+    "Figure 2", "Weighting-adjusted OHI scores", "Fig. 2b", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, countries_main,
+    "Figure 2", "Change in OHI scores due to weighting", "Fig. 2b; Figs. S9b, S10b; text", "Paired t-test, one observation per country (no clustering)", "Country level values",
+        countries_main, blocks_main, participants_main, countries_main,
+    "Figure 2", "Goals are imperfect substitutes", "Fig. 2c; text", "Sign test (H$_0$: median $\\eta_n = 0$) on the participant-level medians $\\eta_n$ of $\\eta_{ng}$, one observation per participant (no clustering)", "Participant level values",
+        fmt_n(nrow(eta_participant_level)), blocks_main, participants_main, NA,
+    "Figure 2", "Median substitutability; shares of $\\eta_{ng}$", "Fig. 2c; text", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, NA,
+    "Figure 2", "Substitutability-adjusted OHI scores", "Fig. 2d", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, countries_main,
+    "Figure 2", "Change in OHI scores due to substitutability", "Fig. 2d; Figs. S9d, S10d; text", "Paired t-test, one observation per country (no clustering)", "Country level values",
+        countries_main, blocks_main, participants_main, countries_main,
+    "Figure 2", "Adjusted OHI scores (weighting and substitutability)", "Fig. 2e", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, countries_main,
+    "Figure 2", "Change in OHI scores due to weighting and substitutability", "Text", "Paired t-test (means); Pitman--Morgan test (variances); one observation per country (no clustering)", "Country level values",
+        countries_main, blocks_main, participants_main, countries_main,
+    "Figure 3", "Decomposition of the score change", "Fig. 3a", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, countries_main,
+    "Figure 3", "Higher weights for goals with lower scores", "Text", "OLS of $\\alpha_{ng}$ on the goal score, standard errors clustered by country", "Decision-block level values",
+        fmt_n(nrow(alpha_score_regression_data)), fmt_n(nrow(alpha_score_regression_data)), fmt_n(n_distinct(alpha_score_regression_data$participant_code)), fmt_n(n_distinct(alpha_score_regression_data$country_code)),
+    "Figure 3", "Score change and goal-score inequality", "Fig. 3b", "Quadratic OLS fit, one observation per country (no clustering)", "Country level values",
+        fmt_n(nrow(panel_fig3_b_data)), blocks_main, participants_main, fmt_n(n_distinct(panel_fig3_b_data$country)),
+    "Figure 3", "Lowest-scoring goals", "Fig. 3c", "Frequency count", "Country level values",
+        countries_main, NA, NA, countries_main,
+    "Figure 3", "Goal-score inequality and GDP per capita", "Fig. 3d; text", "OLS, one observation per country (no clustering)", "Country level values (excl. missing GDP data)",
+        fmt_n(nrow(panel_fig3_d_data)), NA, NA, fmt_n(n_distinct(panel_fig3_d_data$country)),
+    "Figure 4", "Country-specific preferences and scores", "Fig. 4a", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(n_distinct(panel_fig4_a_data$country)),
+    "Figure 4", "Adjusted OHI scores 2012--2022", "Fig. 4b", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(length(timeseries_countries)),
+    "Figure 4", "Change in the mean OHI score 2012--2022", "Text", "Means over countries (2012 vs. 2022)", "Country level values",
+        fmt_n(fig4b_countries_per_year), blocks_main, participants_main, fmt_n(fig4b_countries_per_year),
+    "Figure 4", "Substitutability in OECD vs. non-OECD countries", "Text",
+        sprintf("Wilcoxon rank-sum test on the country medians of $\\eta_{ng}$ (OECD: %s; non-OECD: %s countries), one observation per country (no clustering)", fmt_n(oecd_n[["OECD"]]), fmt_n(oecd_n[["Non-OECD"]])), "Country level values",
+        fmt_n(nrow(estimates_oecdtype_country_level)), blocks_main, participants_main, survey_countries,
+    "Figure 4", "Substitutability and GDP per capita", "Fig. 4c", "Linear fit", "Country level values",
+        fmt_n(nrow(panel_fig4_c_data)), blocks_main, participants_main, fmt_n(nrow(panel_fig4_c_data)),
+    "Figure 4", "Demographics (incl. gender) and substitutability", "Fig. 4d; text", "Median regression of log $\\eta_n$ with country fixed effects, one observation per participant (no clustering)", "Participant level values",
+        fmt_n(nrow(fig4d_data)), fmt_n(sum(ohi_estimates_online$participant_code %in% fig4d_data$participant_code)), fmt_n(n_distinct(fig4d_data$participant_code)), fmt_n(n_distinct(fig4d_data$session_label)),
+    "Methods", "Single crossing", "Methods", "Sign changes of pairwise score differences over the observed $\\eta_n$", "Country-pair level values",
+        fmt_n(choose(nrow(country_scores), 2)), blocks_main, participants_main, countries_main,
+    "SI Appendix", "Goal-pair level estimates", "Fig. S2", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, NA,
+    "SI Appendix", "OHI scores before and after adjustment", "Fig. S3", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(nrow(extdata_fig3_table)),
+    "SI Appendix", "Substitutability-adjusted scores of all OHI countries", "Fig. S4a", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(nrow(extdata_fig4_a_data)),
+    "SI Appendix", "Change in the OHI scores of all OHI countries", "Text", "Paired t-test, one observation per country (no clustering)", "Country level values",
+        fmt_n(fig_s4a_pairs), blocks_main, participants_main, fmt_n(fig_s4a_pairs),
+    "SI Appendix", "Adjusted 2024 OHI scores", "Fig. S4b", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(nrow(extdata_fig4_b_data)),
+    "SI Appendix", "Substitutability of coastal-affine participants ($>$10 days at the coast per year)", "Text",
+        sprintf("Median regression of log $\\eta_n$ on coastal affinity with country fixed effects (coastal-affine: %s; other: %s participants), one observation per participant (no clustering)", fmt_n(coastal_n[["1"]]), fmt_n(coastal_n[["0"]])), "Participant level values",
+        fmt_n(sum(coastal_n)), fmt_n(sum(!is.na(coastal_data$coast_native))), fmt_n(sum(coastal_n)), fmt_n(n_distinct(coastal_rq_data$session_label)),
+    "SI Appendix", "Adjusted OHI scores under the preferences of coastal-affine participants", "Fig. S4c", "Descriptive", "Decision-block level values",
+        fmt_n(sum(coastal_data$coast_native == 1, na.rm = TRUE)), fmt_n(sum(coastal_data$coast_native == 1, na.rm = TRUE)), fmt_n(coastal_n[["1"]]), fmt_n(nrow(extdata_fig4_c_data)),
+    "SI Appendix", "Adjusted OHI scores under mean instead of median preferences", "Fig. S4d", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(nrow(extdata_fig4_d_data)),
+    "SI Appendix", "Demographics and goal weights", "Fig. S5", "Median regressions of $\\alpha_{ng}$ per goal with country fixed effects, bootstrap confidence intervals clustered by participant", "Decision-block level values",
+        fmt_n(sapply(fig5_data, nrow)), fmt_n(sapply(fig5_data, nrow)), fmt_n(sapply(fig5_data, function(d) n_distinct(d$participant_code))), fmt_n(n_distinct(bind_rows(fig5_data)$session_label)),
+    "SI Appendix", "Score and rank changes of the sample countries under country vs. global preferences (ranks among all countries)", "Fig. S6", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, countries_main,
+    "SI Appendix", "Goal weights and goal scores", "Fig. S7a", "Pearson correlation; OLS with goal fixed effects; p-values clustered by country", "Country-goal level values",
+        fmt_n(nrow(goal_alpha_score_data)), blocks_main, participants_main, fmt_n(n_distinct(goal_alpha_score_data$country)),
+    "SI Appendix", "Substitutability and OHI scores", "Fig. S7b", "Pearson correlation", "Country level values",
+        fmt_n(nrow(country_correlation_data)), blocks_main, participants_main, fmt_n(nrow(country_correlation_data)),
+    "SI Appendix", "Adjusted OHI scores, fully rational participants only", "Fig. S8a", "Descriptive", "Decision-block level values",
+        blocks_of(fully_rational_prep), blocks_of(fully_rational_prep), participants_of(fully_rational_prep), countries_of(fully_rational_prep),
+    "SI Appendix", sprintf("Adjusted OHI scores, synthetic balancing to three blocks per participant (incl. %s synthetic blocks)", fmt_n(n_synthetic_blocks)), "Fig. S8b", "Descriptive", "Decision-block level values",
+        blocks_of(synthetic_fill_prep), blocks_of(synthetic_fill_prep), participants_of(synthetic_fill_prep), countries_of(synthetic_fill_prep),
+    "SI Appendix", "Adjusted OHI scores, corner solutions re-included as perfect substitutes ($\\eta = 0$)", "Fig. S8c", "Descriptive", "Decision-block level values",
+        blocks_of(unipref_eta0_prep), blocks_of(unipref_eta0_prep), participants_of(unipref_eta0_prep), countries_of(unipref_eta0_prep),
+    "SI Appendix", "Adjusted OHI scores, corner solutions re-included as near-Leontief ($\\eta = 100$)", "Fig. S8d", "Descriptive", "Decision-block level values",
+        blocks_of(unipref_eta100_prep), blocks_of(unipref_eta100_prep), participants_of(unipref_eta100_prep), countries_of(unipref_eta100_prep),
+    "SI Appendix", "Estimation uncertainty", "Fig. S9", sprintf("Krinsky--Robb, %s draws per decision block from the Tobit sampling distribution", fmt_n(n_kr_draws)), "Decision-block level values",
+        fmt_n(n_blocks), fmt_n(n_blocks), participants_main, countries_main,
+    "SI Appendix", "Sampling uncertainty", "Fig. S10", sprintf("Non-parametric bootstrap clustered by participant (participant-level resampling), %s resamples", fmt_n(n_boot)), "Decision-block level values",
+        fmt_n(n_blocks), fmt_n(n_blocks), fmt_n(n_participants_boot), countries_main,
+    "SI Appendix", "Adjusted OHI scores at the 25th, 40th, 60th and 75th percentiles of $\\eta_{ng}$", "Fig. S11", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, countries_main,
+    "SI Appendix", "Change in OHI scores at these percentiles of $\\eta_{ng}$", "Fig. S11", "Paired t-tests, one observation per country (no clustering)", "Country level values",
+        countries_main, blocks_main, participants_main, countries_main,
+    "SI Appendix", "Descriptive statistics", "Tab. S1", "Descriptive", "Participant level values",
+        fmt_n(nrow(extdata_table_1_data)), blocks_main, fmt_n(n_distinct(extdata_table_1_data$participant_code)), fmt_n(n_distinct(extdata_table_1_data$session_label)),
+    "SI Appendix", "Country-specific preferences and goal scores", "Tab. S2", "Descriptive", "Decision-block level values",
+        blocks_main, blocks_main, participants_main, fmt_n(n_distinct(setdiff(extdata_tab2_data$country_code, "All"))),
+    "SI Appendix", "Preference parameters and goal scores", "Tab. S4", sprintf("Median regressions of $\\ln\\eta_{ng}$ and $\\alpha_{ng}$ with wild bootstrap standard errors clustered by country (%s draws)", fmt_n(n_boot_endog)), "Decision-block level values",
+        fmt_n(eta_endog$n_blocks[1]), fmt_n(eta_endog$n_blocks[1]), fmt_n(eta_endog$n_participants[1]), fmt_n(eta_endog$n_countries[1])
+)
+
+col_widths <- c("4cm", "1.9cm", "5.2cm", "3cm", "1.6cm", "1.7cm", "1.7cm", "1.3cm")
+extdata_tab3 <- kable(sample_overview %>% select(-group), format = "latex",
+      booktabs = TRUE,
+      longtable = TRUE,
+      escape = F,
+      caption = "Information on the samples used in each analysis",
+      label = "samples",
+      linesep = "\\addlinespace", # Increase space between rows
+      align = c(rep('l', ncol(sample_overview) - 1)),
+      col.names = c("Claim / analysis", "Reported in", "Statistic / test / estimator", "Unit of observation", "N", "Decision blocks", "Participants", "Countries")) %>%
+    kable_styling(latex_options = c("hold_position", "repeat_header"), font_size = 8)
+for (i in seq_along(col_widths)) extdata_tab3 <- column_spec(extdata_tab3, i, width = col_widths[i])
+extdata_tab3 <- extdata_tab3 %>%
+    pack_rows(index = table(forcats::fct_inorder(sample_overview$group)), indent = FALSE) %>%
+    landscape()
+
+# Table note in the last foot of the longtable, as wide as the table (kableExtra's footnote() does not wrap long notes
+# in a longtable)
+note_width <- paste0("\\dimexpr ", paste(col_widths, collapse = " + "), " + ", 2 * (length(col_widths) - 1), "\\tabcolsep\\relax")
+extdata_tab3[1] <- sub("\\bottomrule\n\\endlastfoot",
+                       paste0("\\bottomrule\n\\multicolumn{", length(col_widths), "}{p{", note_width, "}}{\\rule{0pt}{1em}",
+                              "\\textit{Note:} `Countries' refers to the number of countries considered in the respective analysis, ",
+                              "where applicable. The participants in the experimental data were always recruited from ",
+                              survey_countries, " countries.}\\\\\n\\endlastfoot"),
+                       extdata_tab3, fixed = TRUE)
+stopifnot(grepl("\\textit{Note:}", extdata_tab3, fixed = TRUE)) # The note must have been placed
+save_kable(extdata_tab3, file = here("2_Graphs", "SI_Appendix_TabS3.tex"))
+```
+
+# SI Appendix Tab. S4: Endogeneity of the preferences
+
+```{r tab-s4}
+# Cell of a coefficient: estimate per 10 score points, bootstrap standard error in parentheses
+endog_cell <- function(res, term) {
+    r <- res[res$term == term, ]
+    if (!nrow(r)) return("")
+    num <- function(x) gsub("-", "$-$", sprintf("%.4f", 10 * x), fixed = TRUE)
+    linebreak(sprintf("%s\n(%s)", num(r$estimate), num(r$std.error)), align = "c")
+}
+stopifnot(identical(eta_endog$n_blocks[1], alpha_endog$n_blocks[1])) # Both regressions use the same decision blocks
+
+extdata_tab4_data <- tribble(
+    ~row, ~eta, ~alpha,
+    "Sum of goal scores, $x_{ic} + x_{jc}$", endog_cell(eta_endog, "score_sum"), endog_cell(alpha_endog, "score_sum"),
+    "Absolute difference of goal scores, $|x_{ic} - x_{jc}|$", endog_cell(eta_endog, "score_absdiff"), endog_cell(alpha_endog, "score_absdiff"),
+    "Signed difference of goal scores, $x_{ic} - x_{jc}$", endog_cell(eta_endog, "score_diff"), endog_cell(alpha_endog, "score_diff"),
+    "N", fmt_n(eta_endog$n_blocks[1]), fmt_n(alpha_endog$n_blocks[1])
+)
+
+col_widths_tab4 <- c("6.5cm", "2.6cm", "2.6cm")
+extdata_tab4 <- kable(extdata_tab4_data, format = "latex",
+      booktabs = TRUE,
+      escape = F,
+      caption = "Endogeneity of preference parameters",
+      label = "endogeneity",
+      linesep = "\\addlinespace", # Increase space between rows
+      align = c("l", "c", "c"),
+      col.names = c("", "(1) $\\ln\\eta_{ng}$", "(2) $\\alpha_{ng}$")) %>%
+    kable_styling(latex_options = c("hold_position"), font_size = 8) %>%
+    row_spec(3, hline_after = TRUE)
+for (i in seq_along(col_widths_tab4)) extdata_tab4 <- column_spec(extdata_tab4, i, width = col_widths_tab4[i])
+
+# Table note directly below the table, as wide as the table (as for Table S3)
+note_width_tab4 <- paste0("\\dimexpr ", paste(col_widths_tab4, collapse = " + "), " + ", 2 * (length(col_widths_tab4) - 1), "\\tabcolsep\\relax")
+extdata_tab4[1] <- sub("\\bottomrule\n",
+                       paste0("\\bottomrule\n\\multicolumn{", length(col_widths_tab4), "}{p{", note_width_tab4, "}}{\\rule{0pt}{1em}",
+                              "\\textit{Note:} Median regressions on the decision-block level. The dependent variables are the substitutability ",
+                              "$\\ln\\eta_{ng}$ (column 1) and the weight $\\alpha_{ng}$ on goal $i$ (column 2) of participant $n$ for goal pair $g$. ",
+                              "Variables $x_{ic}$ and $x_{jc}$ are the 2022 OHI scores of goals $i$ and $j$ in the country $c$ of participant $n$. ",
+                              "Coefficients are per 10 score points. Standard errors in parentheses are from a wild bootstrap clustered at the ",
+                              "country level with ", fmt_n(n_boot_endog), " draws.}\\\\\n"),
+                       extdata_tab4, fixed = TRUE)
+stopifnot(grepl("\\textit{Note:}", extdata_tab4, fixed = TRUE)) # The note must have been placed
+save_kable(extdata_tab4, file = here("2_Graphs", "SI_Appendix_TabS4.tex"))
+```

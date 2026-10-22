@@ -1,0 +1,190 @@
+---
+title: "Sample Selection"
+format:
+  html:
+    include: false
+    self-contained: true
+---
+
+```{r setup, warning = FALSE, message = FALSE}
+library(dplyr)
+library(here)
+library(readr)
+```
+
+# Load data
+
+```{r load-data, message = FALSE}
+estimates_raw <- read_csv(here("1_Data", "2_processed", "Matlab_Results_OHI_online.csv")) %>% na.omit()
+quality_controls <- read_csv(here("1_Data", "2_processed", "Quality_Controls.csv"))
+garp_results <- read_csv(here("1_Data", "2_processed", "GARP_results_online_sample.csv"))
+survey_data <- read_csv(here("1_Data", "2_processed", "Data_online_survey.csv"))
+
+# Lists of completed participants from the three survey waves
+read_completes <- function(...) {
+  read_csv(here("1_Data", "1_raw", ...), col_types = list(participant_label = col_character()))
+}
+completes <- rbind(read_completes("2023_11_Bilendi", "Completes_sl12.csv"),
+                   read_completes("2023_11_Bilendi", "Completes_fl.csv"),
+                   read_completes("2024_12_Dynata", "Completes_fl2.csv"))
+```
+
+# Prepare data
+
+```{r prepare-data}
+# Lowercase session labels (raw data mixes "Indonesia" and "indonesia") and add participant code
+completes <- completes %>%
+  mutate(session_label = tolower(session_label)) %>%
+  left_join(survey_data[, c("participant_code", "participant_label")], by = "participant_label")
+
+# Country code for each session label
+country_codes <- tribble(
+  ~session_label, ~country_abrv,
+  "indonesia",    "ID",
+  "canada-en",    "CA",
+  "canada-fr",    "CA",
+  "canada",       "CA",
+  "australia",    "AU",
+  "china",        "CN",
+  "france",       "FR",
+  "germany",      "DE",
+  "india",        "IN",
+  "japan",        "JA",
+  "nigeria",      "NI",
+  "peru",         "PE",
+  "philippines",  "PH",
+  "usa",          "US"
+)
+
+# One row per participant-task with all quality criteria
+tasks <- quality_controls %>%
+  left_join(garp_results, by = "participant_code") %>%
+  left_join(estimates_raw[, c("participant_code", "task_number", "unipref")],
+            by = c("participant_code", "task_number")) %>%
+  left_join(survey_data[, c("participant_code", "gender", "age")], by = "participant_code") %>%
+  filter(participant_code %in% completes$participant_code) %>%
+  group_by(participant_code) %>%
+  filter(n() < 5) %>% # Drop 131 early participants with 5 tasks (all others had 3)
+  ungroup()
+```
+
+# Exclusion criteria
+
+```{r exclusion-criteria}
+# Flag tasks that pass the quality criteria (with and without the unipref criterion)
+tasks <- tasks %>%
+  mutate(passes_without_unipref = ccei >= 0.8 &
+                                  minutes_on_experiment > 5 &
+                                  minutes_on_experiment < 120 &
+                                  comprehension_errors_hidden < 10,
+         passes_all = passes_without_unipref & unipref == 0)
+
+eligible_tasks <- tasks %>% filter(passes_all)
+```
+
+# Report exclusions
+
+Criteria are applied in the same order as in the manuscript. Each share refers to the sample remaining after all earlier criteria. Participant-level criteria remove all tasks of a participant, task-level criteria (CCEI, unipref) remove single tasks.
+
+```{r exclusion-reporting}
+# Print the number and share of participants or tasks removed by one criterion
+report_step <- function(data, drop, label, unit) {
+  removed <- filter(data, drop)
+  if (unit == "participants") {
+    n_removed <- n_distinct(removed$participant_code)
+    n_total <- n_distinct(data$participant_code)
+  } else {
+    n_removed <- nrow(removed)
+    n_total <- nrow(data)
+  }
+  cat(sprintf("%-24s %d / %d %s = %.2f%%\n", label, n_removed, n_total, unit, 100 * n_removed / n_total))
+  filter(data, !drop)
+}
+
+report <- tasks
+report <- report_step(report, report$age < 18, "Age < 18:", "participants")
+report <- report_step(report, !(report$gender %in% c("male", "female")), "Gender not male/female:", "participants")
+report <- report_step(report, report$minutes_on_experiment <= 5 | report$minutes_on_experiment >= 120, "Time <= 5 or >= 120 min:", "participants")
+report <- report_step(report, report$comprehension_errors_hidden >= 10, "Comprehension >= 10:", "participants")
+report <- report_step(report, report$ccei < 0.8, "CCEI < 0.8:", "tasks")
+report <- report_step(report, report$unipref != 0, "unipref != 0:", "tasks")
+cat(sprintf("Remaining eligible: %d participants, %d tasks\n", n_distinct(report$participant_code), nrow(report)))
+```
+
+# Representative sample draw {.hidden .unnumbered .unlisted}
+
+We oversampled for some countries and genders. For the main analysis we therefore draw a random sample such that we have the maximum number of eligible participants but still maintain a representative sample by gender in each country.
+
+```{r gender-shares, message = FALSE}
+# Gender shares by country from the UN Population Data (2020, all age groups)
+representative_shares <- read_csv(here("1_Data", "1_raw", "UN Population Data", "unpopulation_dataportal_20231016133527.csv")) %>%
+  filter(Sex %in% c("Female", "Male")) %>%
+  group_by(Location, Iso2, Sex) %>%
+  summarize(n = sum(Value), .groups = "drop_last") %>%
+  mutate(target_share = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(gender = tolower(Sex),
+         country_abrv = recode(Iso2, "JP" = "JA", "NG" = "NI")) %>% # Match the country codes used above
+  select(country_abrv, gender, target_share)
+```
+
+```{r draw-function}
+# Draw a representative random sample (by country and gender) from the participants in `tasks`
+draw_representative_sample <- function(tasks) {
+  # Eligible adult male and female participants with country
+  participants <- tasks %>%
+    distinct(participant_code) %>%
+    left_join(completes[, c("participant_code", "session_label")], by = "participant_code") %>%
+    left_join(country_codes, by = "session_label") %>%
+    left_join(survey_data[, c("participant_code", "gender", "age")], by = "participant_code") %>%
+    filter(age >= 18, gender %in% c("male", "female")) %>%
+    select(participant_code, country_abrv, gender)
+
+  # Number of participants to draw per country and gender: largest sample that matches the target shares
+  participants <- participants %>%
+    left_join(representative_shares, by = c("country_abrv", "gender")) %>%
+    group_by(country_abrv, gender) %>%
+    mutate(n_available = n()) %>%
+    group_by(country_abrv) %>%
+    mutate(to_draw = floor(floor(min(n_available / target_share)) * target_share)) %>%
+    ungroup()
+
+  # Draw the sample and add the participants' tasks
+  set.seed(123)
+  participants %>%
+    group_by(country_abrv, gender) %>%
+    group_modify(~ slice_sample(.x, n = .x$to_draw[1])) %>%
+    ungroup() %>%
+    select(participant_code, country_abrv, gender) %>%
+    left_join(tasks[, c("participant_code", "task_number")], by = "participant_code")
+}
+```
+
+# Main sample
+
+```{r main-sample}
+# Draw from all participants with at least one eligible task
+main_sample_selection <- draw_representative_sample(eligible_tasks)
+write_csv(main_sample_selection, here("1_Data", "2_processed", "main_sample_selection.csv"))
+```
+
+# Sensitivity samples
+
+```{r fully-rational-sample}
+# Only participants for whom all tasks are eligible
+fully_rational_tasks <- tasks %>%
+  group_by(participant_code) %>%
+  filter(all(passes_all)) %>%
+  ungroup()
+
+main_sample_selection_fullyrational <- draw_representative_sample(fully_rational_tasks)
+write_csv(main_sample_selection_fullyrational, here("1_Data", "2_processed", "main_sample_selection_fullyrational.csv"))
+```
+
+```{r unipref-sample}
+# Same participants as the main sample, but also keep their tasks excluded only due to unipref
+main_sample_selection_unipref <- main_sample_selection %>%
+  distinct(participant_code, country_abrv, gender) %>%
+  left_join(filter(tasks, passes_without_unipref)[, c("participant_code", "task_number")], by = "participant_code")
+write_csv(main_sample_selection_unipref, here("1_Data", "2_processed", "main_sample_selection_unipref.csv"))
+```
